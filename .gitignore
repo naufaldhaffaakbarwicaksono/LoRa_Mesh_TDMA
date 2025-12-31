@@ -75,13 +75,16 @@ data_collection/*.json
 *.png
 *.json
 
-# Exception: Keep example/documentation images
+# Exception: Keep example/documentation images and test data
 !docs/**/*.png
 !examples/**/*.png
 !images/**/*.png
 !README*.png
 !**/example*.png
 !**/sample*.png
+!data_collection/topology_star.csv
+!data_collection/topology_branch.csv
+!data_collection/wifi_events2.csv
 
 # Visualization outputs
 tdma_timeline.png
