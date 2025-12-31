@@ -1,59 +1,29 @@
-/*****************************************************************************************************
-  LoRa Mesh Network Node for SX1262 - Ra01S LIBRARY VERSION
-  Migrated from SX1262_TimingControl to Ra01S (SX126x class) library
-  
-  Features:
-  - TDMA-based mesh networking with automatic slot assignment
-  - Collision avoidance through neighbor discovery
-  - Multi-hop message routing
-  - OLED display with rotary encoder navigation
-  - Sensor integration (simulated temperature/humidity/battery)
-  
-  Hardware Requirements:
-  - ESP32 with SX1262 LoRa module (Ra01S compatible)
-  - SSD1306 OLED display (128x64)
-  - Rotary encoder with push button
-  - AHT10 temperature/humidity sensor (optional)
-  - INA219 power monitor (optional)
-  
-  Configure your node in settings.h before uploading!
-  
-  MIGRATION NOTES (Ra01S Library):
-  ════════════════════════════════════════════════════════════════════════════
-  - Ra01S uses POLLING mode instead of callbacks/interrupts
-  - radio.Receive() polls for incoming data (non-blocking)
-  - radio.Send() can be synchronous (SX126x_TXMODE_SYNC) or async
-  - Simplified code - no semaphores, no ISR callbacks needed
-  - All timing still in microseconds for TDMA precision
-*******************************************************************************************************/
 
 #include <Wire.h>
 #include <SPI.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include <Adafruit_AHTX0.h>
+#include <Adafruit_INA219.h>
 #include <Arduino.h>
-#include "Ra01S.h"  // Ra01S library (SX126x class)
+#include "Ra01S.h"
 #include "settings.h"
-#include "config_manager.h"  // EEPROM config & serial commands
+#include "config_manager.h"
 #include <sys/time.h>
 
-// WiFi untuk NTP time sync & remote monitoring
 #if ENABLE_WIFI == 1
   #include <WiFi.h>
   #include <WiFiUdp.h>
   #include <time.h>
   
-  // WiFi UDP objects for remote monitoring
-  WiFiUDP udpMonitor;  // Send events to monitoring server
-  WiFiUDP udpCommand;  // Receive commands from control script
+  WiFiUDP udpMonitor;
+  WiFiUDP udpCommand;
 #endif
 
-// Timer Interrupt
 hw_timer_t * tdmaTimer = NULL;
 portMUX_TYPE timerMux = portMUX_INITIALIZER_UNLOCKED;
 
-// ============= SERIAL DEBUG MACROS =============
-// Conditional compilation - zero overhead when disabled
+// Debug macros - conditional compilation
 #if ENABLE_SERIAL_DEBUG == 1
   #define DEBUG_PRINT(fmt, ...)       Serial.printf(fmt, ##__VA_ARGS__)
   #define DEBUG_PRINTLN(str)          Serial.println(str)
@@ -64,61 +34,48 @@ portMUX_TYPE timerMux = portMUX_INITIALIZER_UNLOCKED;
   #define DEBUG_PRINT_LATENCY(...)    // No-op
 #endif
 
-// Critical logs (always enabled, even in production)
 #define LOG_ERROR(fmt, ...)           Serial.printf("[ERROR] " fmt, ##__VA_ARGS__)
 #define LOG_INFO(fmt, ...)            Serial.printf("[INFO] " fmt, ##__VA_ARGS__)
 
-// ============= HARDWARE OBJECTS =============
+// Hardware objects
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
-
-// Ra01S (SX126x) radio object
-// Constructor: SX126x(spiSelect, reset, busy, txen, rxen)
 SX126x radio(LORA_PIN_NSS, LORA_PIN_RESET, LORA_PIN_BUSY, LORA_TXEN, LORA_RXEN);
+Adafruit_AHTX0 aht;
+Adafruit_INA219 ina219;
 
-// ============= TIME MANAGEMENT =============
 #if ENABLE_WIFI == 1
   bool timeSynced = false;
-  
-  // NTP sync reference
-  int64_t ntpEpochAtSync = 0;   // NTP epoch time at sync (microseconds)
-  uint64_t microsAtSync = 0;    // micros() value at NTP sync
-  
-  // Drift compensation (with overflow protection)
-  int32_t driftPpm = 0;         // Measured clock drift (parts per million, limited to ±100)
-  uint64_t lastDriftCheck = 0;  // Last drift check/re-sync time
+  int64_t ntpEpochAtSync = 0;
+  uint64_t microsAtSync = 0;
+  int32_t driftPpm = 0;
+  uint64_t lastDriftCheck = 0;
 #endif
 
-// ============= MULTI-PAGE DISPLAY =============
+// Display & FreeRTOS
 uint8_t currentPage = DISPLAY_PAGE_INFO;
 uint32_t lastDisplayUpdate = 0;
 bool displayNeedsUpdate = true;
 
-// FreeRTOS Task Handles & Synchronization
 TaskHandle_t displayTaskHandle = NULL;
 TaskHandle_t dataLogTaskHandle = NULL;
 TaskHandle_t wifiMonitorTaskHandle = NULL;
 SemaphoreHandle_t displayMutex = NULL;
 QueueHandle_t logQueue = NULL;
 
-// WiFi Event Queue (for remote monitoring)
 #if ENABLE_WIFI == 1 && DEBUG_MODE == DEBUG_MODE_WIFI_MONITOR
-  #define WIFI_EVENT_QUEUE_SIZE 100  // Increased for PDR/Latency data
+  #define WIFI_EVENT_QUEUE_SIZE 100
   
   struct WiFiEvent {
-    char message[300];  // Formatted event message (increased for detailed stats)
+    char message[300];
   };
   
   QueueHandle_t wifiEventQueue = NULL;
-  
-  // WiFi Monitor PDR & Latency tracking (same as gateway mode)
   #define WIFI_ENABLE_PDR_TRACKING 1
   #define WIFI_ENABLE_LATENCY_CALC 1
 #endif
 
-// ============= DATA LOGGING STRUCTURES =============
-// Data logging structure (used when DEBUG_MODE == DEBUG_MODE_GATEWAY_ONLY)
 struct DataLogEntry {
-  uint8_t logType;  // 0=PDR, 1=Latency, 2=Packet, 3=Sync
+  uint8_t logType;
   uint32_t timestamp;
   uint16_t nodeId;
   uint16_t messageId;
@@ -132,7 +89,6 @@ struct DataLogEntry {
 
 #define LOG_QUEUE_SIZE 50
 
-// ============= RUNTIME CONFIGURATION (FROM EEPROM) =============
 RuntimeConfig runtimeConfig;
 char activeSSID[MAX_SSID_LEN + 1];
 char activePassword[MAX_PASS_LEN + 1];
@@ -140,14 +96,12 @@ char activeServerIP[MAX_IP_LEN + 1];
 uint8_t activeDebugMode;
 bool configLoaded = false;
 
-// ============= TDMA CONTROL =============
-volatile bool tdmaEnabled = true;  // Control TDMA execution
+volatile bool tdmaEnabled = true;
 
-// ============= TIMER INTERRUPT FLAGS =============
 volatile bool tdmaSlotTick = false;
 volatile uint32_t tdmaInterruptCount = 0;
 
-// ============= ENCODER VARIABLES =============
+// Encoder
 volatile int32_t encoderRaw = 0;
 volatile bool buttonPressed = false;
 volatile uint32_t lastEncoderISR = 0;
@@ -155,8 +109,6 @@ volatile uint32_t lastButtonISR = 0;
 const uint32_t ENCODER_DEBOUNCE_US = 500;
 const uint32_t BUTTON_DEBOUNCE_MS = 150;
 
-// ============= MESH NETWORK VARIABLES =============
-// RSSI threshold: ignore neighbors below -115 dBm
 #define RSSI_THRESHOLD_DBM -115
 
 NeighbourInfo neighbours[MAX_NEIGHBOURS];
@@ -164,21 +116,17 @@ uint8_t neighbourIndices[MAX_NEIGHBOURS];
 uint8_t neighbourCount = 0;
 MyNodeInfo myInfo;
 
-// TX/RX Buffers
 uint8_t rxBuffer[RXBUFFER_SIZE];
 uint8_t txBuffer[TXBUFFER_SIZE];
 uint8_t rxPacketLength = 0;
 uint8_t txPacketLength = 0;
 
-// Slot availability tracking
 bool slotAvailability[Nslot];
 
-// Message handling - unified with neighbor broadcast
 char sensorDataToSend[SENSOR_DATA_LENGTH + 1];
 char sensorDataReceived[SENSOR_DATA_LENGTH + 1];
 bool hasSensorDataToSend = false;
 
-// FIFO Forwarding Queue
 #define FORWARD_QUEUE_SIZE 8
 struct ForwardMessage {
   uint16_t originalSender;
@@ -188,21 +136,18 @@ struct ForwardMessage {
   char data[SENSOR_DATA_LENGTH + 1];
   uint16_t tracking[MAX_TRACKING_HOPS];
   #if ENABLE_WIFI == 1 && ENABLE_LATENCY_CALC == 1
-    int64_t txTimestampUs;  // Original TX timestamp from sender
+    int64_t txTimestampUs;
   #endif
 };
 ForwardMessage forwardQueue[FORWARD_QUEUE_SIZE];
-uint8_t forwardQueueHead = 0;  // Index to write
-uint8_t forwardQueueTail = 0;  // Index to read
+uint8_t forwardQueueHead = 0;
+uint8_t forwardQueueTail = 0;
 uint8_t forwardQueueCount = 0;
 
-// ============= MESSAGE TRACKING =============
 uint16_t messageIdCounter = 0;
 uint16_t ownMessageOrigSender = 0;
 uint16_t ownMessageId = 0;
 
-// ============= LATENCY TRACKING =============
-// Enable for both GATEWAY_ONLY and WIFI_MONITOR modes
 #if (ENABLE_WIFI == 1 && ENABLE_LATENCY_CALC == 1) || (ENABLE_WIFI == 1 && DEBUG_MODE == DEBUG_MODE_WIFI_MONITOR)
   #ifndef LATENCY_CACHE_SIZE
     #define LATENCY_CACHE_SIZE 20
@@ -217,28 +162,25 @@ uint16_t ownMessageId = 0;
     int64_t latencyUs;
   };
   LatencyRecord latencyRecords[LATENCY_CACHE_SIZE];
-  uint8_t latencyRecordIndex = 0;  // Circular buffer index
-  uint8_t latencyRecordCount = 0;  // Total records (capped at LATENCY_CACHE_SIZE)
+  uint8_t latencyRecordIndex = 0;
+  uint8_t latencyRecordCount = 0;
   
-  // TX timestamp cache for sent messages (circular buffer)
   struct TxTimestampCache {
     uint16_t messageId;
     int64_t timestampUs;
   };
   TxTimestampCache txTimestampCache[LATENCY_CACHE_SIZE];
-  uint8_t txTimestampCacheIndex = 0;  // Circular buffer index
-  uint8_t txTimestampCacheCount = 0;  // Current count
+  uint8_t txTimestampCacheIndex = 0;
+  uint8_t txTimestampCacheCount = 0;
   
-  // Statistics
   uint32_t totalLatencyCalculations = 0;
   int64_t totalLatencyUs = 0;
   int64_t minLatencyUs = INT64_MAX;
   int64_t maxLatencyUs = 0;
 #endif
 
-// ============= PDR (Packet Delivery Ratio) TRACKING =============
 #define MAX_PDR_NODES 10
-// Enable PDR for GATEWAY_ONLY and WIFI_MONITOR modes
+
 #if DEBUG_MODE == DEBUG_MODE_GATEWAY_ONLY || DEBUG_MODE == DEBUG_MODE_WIFI_MONITOR
   #define ENABLE_PDR_TRACKING 1
 #else
@@ -248,16 +190,14 @@ uint16_t ownMessageId = 0;
 #if ENABLE_PDR_TRACKING == 1
   struct PdrNodeStats {
     uint16_t nodeId;
-    uint16_t lastSeqReceived;     // Last sequence number received
-    uint16_t expectedCount;       // Expected packet count (based on sequence)
-    uint16_t receivedCount;       // Actually received count
-    uint16_t gapCount;            // Detected gaps (lost packets)
-    float pdr;                    // Packet Delivery Ratio (%)
-    uint32_t lastUpdateTime;      // Last packet received time
-    bool initialized;             // First packet received flag
-    
-    // Latency statistics (for this specific node)
-    uint32_t latencyCount;        // Number of latency measurements
+    uint16_t lastSeqReceived;
+    uint16_t expectedCount;
+    uint16_t receivedCount;
+    uint16_t gapCount;
+    float pdr;
+    uint32_t lastUpdateTime;
+    bool initialized;
+    uint32_t latencyCount;
     int64_t totalLatencyUs;       // Sum of all latencies
     int64_t minLatencyUs;         // Minimum latency
     int64_t maxLatencyUs;         // Maximum latency
@@ -267,14 +207,12 @@ uint16_t ownMessageId = 0;
   PdrNodeStats pdrStats[MAX_PDR_NODES];
   uint8_t pdrNodeCount = 0;
   
-  // Overall network statistics
   uint32_t totalPacketsExpected = 0;
   uint32_t totalPacketsReceived = 0;
   uint32_t totalPacketsLost = 0;
   float networkPdr = 100.0;
 #endif
 
-// ============= WIFI BATCH BUFFER =============
 #define WIFI_BATCH_SIZE 10
 struct WifiMessage {
   uint16_t origSender;
@@ -286,30 +224,33 @@ struct WifiMessage {
 WifiMessage wifiBatchBuffer[WIFI_BATCH_SIZE];
 uint8_t wifiBatchCount = 0;
 
-// ============= RX DATA =============
-// Ra01S returns RSSI/SNR via GetPacketStatus()
 int8_t rxRssi = 0;
 int8_t rxSnr = 0;
 
-// ============= TIMING VARIABLES =============
 uint8_t loopCounter = 0;
 
-// ============= AUTO-SEND MESSAGE CONFIG =============
-#define AUTO_SEND_INTERVAL_CYCLES 6  // 6 cycles for 1 gateway + 5 sensor nodes
+#define AUTO_SEND_INTERVAL_CYCLES 6
 uint8_t autoSendCounter = 0;
 
-// Cycle validation for sequential transmission
 bool cycleValidated = false;
 uint8_t cycleValidationCount = 0;
 int8_t lastReceivedCycle = -1;
-#define CYCLE_VALIDATION_THRESHOLD 3  // Changed from 5 to 3 for faster validation
+#define CYCLE_VALIDATION_THRESHOLD 3
 
-// Simulated sensor data
-float simTemperature = 25.0;
-float simHumidity = 60.0;
-uint8_t simBattery = 85;
+// Sensor data
+float currentTemperature = 25.0;
+float currentHumidity = 60.0;
+uint8_t currentBattery = 85;
+float currentVoltage = 7.4;  // 2S battery voltage
 
-// ============= WIFI BATCH FUNCTIONS =============
+uint32_t lastSensorRead = 0;
+#define SENSOR_READ_INTERVAL 5000
+
+// 2S battery config
+#define BATTERY_2S_MAX 8.4
+#define BATTERY_2S_MIN 6.0
+#define BATTERY_2S_NOM 7.4
+
 void sendWifiBatch() {
   #if ENABLE_WIFI == 1
     if (wifiBatchCount == 0) return;
@@ -318,19 +259,6 @@ void sendWifiBatch() {
     Serial.printf("[Node %d] [WIFI] Sending batch of %d messages to server...\n", 
                   myInfo.id, wifiBatchCount);
     
-    // TODO: Implement actual HTTP POST request here
-    // Format: JSON array with all buffered messages
-    // Example:
-    // {
-    //   "gateway_id": 1,
-    //   "timestamp": 1234567890,
-    //   "messages": [
-    //     {"sender": 2, "msg_id": 546, "data": "T21H62", "tracking": [2]},
-    //     {"sender": 3, "msg_id": 803, "data": "T23H66", "tracking": [3]}
-    //   ]
-    // }
-    
-    // For now, just print the batch
     Serial.printf("[Node %d] [WIFI] Batch payload:\n", myInfo.id);
     for (uint8_t i = 0; i < wifiBatchCount; i++) {
       Serial.printf("  [%d] MsgID:%d From:%d Data:%s Track:", 
@@ -351,18 +279,15 @@ void sendWifiBatch() {
   #endif
 }
 
-// ============= STATISTICS =============
 uint32_t txPacketCount = 0;
 uint32_t rxPacketCount = 0;
 int16_t lastRssi = 0;
 int8_t lastSnr = 0;
 char nodeStatus[12] = "INIT";
 
-// ============= TIMING MEASUREMENT =============
 uint32_t lastTxDuration_us = 0;
 uint32_t lastRxDuration_us = 0;
 
-// ============= FUNCTION PROTOTYPES =============
 void IRAM_ATTR encoderISR();
 void IRAM_ATTR buttonISR();
 
@@ -370,7 +295,6 @@ void initLoRa();
 void initDisplay();
 void initEncoder();
 
-// Data logging functions (used when DEBUG_MODE != DEBUG_MODE_OFF)
 void dataLogTask(void* parameter);
 void logPacketData(uint16_t nodeId, uint16_t msgId, uint8_t hopCount, int64_t latencyUs, int16_t rssi, int8_t snr);
 void initMyInfo();
@@ -389,15 +313,12 @@ bool dequeueForward(ForwardMessage* msg);
 
 ResponderOutput responder(uint32_t timeoutMs);
 
-// ============= PDR TRACKING FUNCTIONS =============
 #if ENABLE_PDR_TRACKING == 1
 void updatePdrStats(uint16_t nodeId, uint16_t messageId);
 void updateNodeLatency(uint16_t nodeId, int64_t latencyUs);
 #endif
 
-// ============= TIME MANAGEMENT FUNCTIONS =============
 #if ENABLE_WIFI == 1
-// Get current time in microseconds since epoch with drift compensation
 int64_t getCurrentTimeUs() {
   if (!timeSynced) return 0;
   
@@ -418,7 +339,6 @@ int64_t getCurrentTimeUs() {
   #endif
 }
 
-// Periodic NTP re-sync with drift measurement (overflow-safe)
 void updateDriftCompensation() {
   #if ENABLE_DRIFT_COMPENSATION == 1
     if (!timeSynced) return;
@@ -484,7 +404,6 @@ void formatTimestamp(int64_t timeUs, char* buffer, size_t bufSize) {
 }
 #endif
 
-// ============= TIMER INTERRUPT ISR =============
 void IRAM_ATTR onTdmaTimer() {
   portENTER_CRITICAL_ISR(&timerMux);
   tdmaSlotTick = true;
@@ -492,14 +411,10 @@ void IRAM_ATTR onTdmaTimer() {
   portEXIT_CRITICAL_ISR(&timerMux);
 }
 
-// ============= PDR TRACKING IMPLEMENTATIONS =============
 #if ENABLE_PDR_TRACKING == 1
 void updatePdrStats(uint16_t nodeId, uint16_t messageId) {
-  // Extract sequence number from messageId
-  // Assuming messageId format: (nodeId << 8) | sequenceCounter
   uint16_t seqNum = messageId & 0xFF;
   
-  // Find or create entry for this node
   int8_t nodeIndex = -1;
   for (uint8_t i = 0; i < pdrNodeCount; i++) {
     if (pdrStats[i].nodeId == nodeId) {
@@ -508,7 +423,6 @@ void updatePdrStats(uint16_t nodeId, uint16_t messageId) {
     }
   }
   
-  // Create new entry if not found
   if (nodeIndex == -1 && pdrNodeCount < MAX_PDR_NODES) {
     nodeIndex = pdrNodeCount;
     pdrStats[nodeIndex].nodeId = nodeId;
@@ -594,9 +508,7 @@ void updatePdrStats(uint16_t nodeId, uint16_t messageId) {
   }
 }
 
-// Update latency statistics for specific node
 void updateNodeLatency(uint16_t nodeId, int64_t latencyUs) {
-  // Find node in PDR stats
   for (uint8_t i = 0; i < pdrNodeCount; i++) {
     if (pdrStats[i].nodeId == nodeId) {
       pdrStats[i].latencyCount++;
@@ -623,7 +535,6 @@ void updateNodeLatency(uint16_t nodeId, int64_t latencyUs) {
 }
 #endif
 
-// ============= ENCODER ISR =============
 void IRAM_ATTR encoderISR() {
   uint32_t now = micros();
   if (now - lastEncoderISR < ENCODER_DEBOUNCE_US) return;
@@ -646,7 +557,6 @@ void IRAM_ATTR encoderISR() {
   oldState = newState;
 }
 
-// ============= BUTTON ISR =============
 void IRAM_ATTR buttonISR() {
   uint32_t now = millis();
   if (now - lastButtonISR < BUTTON_DEBOUNCE_MS) return;
@@ -660,7 +570,6 @@ void IRAM_ATTR buttonISR() {
   }
 }
 
-// ============= INITIALIZATION FUNCTIONS =============
 void initEncoder() {
   pinMode(ENCODER_A, INPUT_PULLUP);
   pinMode(ENCODER_B, INPUT_PULLUP);
@@ -681,7 +590,6 @@ void initDisplay() {
     while(1);
   }
   
-  // Create mutex for thread-safe display access
   displayMutex = xSemaphoreCreateMutex();
   if (displayMutex == NULL) {
     Serial.println("[DISPLAY] Failed to create mutex!");
@@ -696,6 +604,51 @@ void initDisplay() {
   display.println("Ra01S Library");
   display.println("Initializing...");
   display.display();
+}
+
+void initSensors() {
+  Serial.println("[SENSOR] Initializing AHT10...");
+  if (!aht.begin()) {
+    Serial.println("[SENSOR] AHT10 not found! Using default values.");
+  } else {
+    Serial.println("[SENSOR] AHT10 initialized successfully");
+  }
+  
+  Serial.println("[SENSOR] Initializing INA219...");
+  if (!ina219.begin()) {
+    Serial.println("[SENSOR] INA219 not found! Using default values.");
+  } else {
+    ina219.setCalibration_32V_2A();
+    Serial.println("[SENSOR] INA219 initialized for 2S battery monitoring");
+  }
+}
+
+void updateSensorReadings() {
+  uint32_t now = millis();
+  
+  if (now - lastSensorRead >= SENSOR_READ_INTERVAL) {
+    lastSensorRead = now;
+    
+    sensors_event_t humidity_event, temp_event;
+    if (aht.getEvent(&humidity_event, &temp_event)) {
+      currentTemperature = temp_event.temperature;
+      currentHumidity = humidity_event.relative_humidity;
+    }
+    
+    currentVoltage = ina219.getBusVoltage_V();
+    
+    if (currentVoltage >= BATTERY_2S_MAX) {
+      currentBattery = 100;
+    } else if (currentVoltage <= BATTERY_2S_MIN) {
+      currentBattery = 0;
+    } else {
+      float percentage = ((currentVoltage - BATTERY_2S_MIN) / (BATTERY_2S_MAX - BATTERY_2S_MIN)) * 100.0;
+      currentBattery = (uint8_t)constrain(percentage, 0, 100);
+    }
+    
+    Serial.printf("[SENSOR] T:%.1f°C H:%.1f%% V:%.2fV Bat:%d%%\n", 
+                  currentTemperature, currentHumidity, currentVoltage, currentBattery);
+  }
 }
 
 void initLoRa() {
@@ -720,10 +673,6 @@ void initLoRa() {
     while(1);
   }
   
-  // Configure LoRa modulation parameters
-  // LoRaConfig(sf, bw, cr, preambleLen, payloadLen, crcOn, invertIQ)
-  // payloadLen = 0 for variable length (explicit header)
-  // payloadLen > 0 for fixed length (implicit header)
   radio.LoRaConfig(
     LORA_SPREADING_FACTOR,   // SF7 = 7
     LORA_BANDWIDTH,          // BW125 = 0x04
@@ -734,7 +683,6 @@ void initLoRa() {
     false                    // Standard IQ
   );
   
-  // Disable debug after init
   radio.DebugPrint(false);
   
   Serial.println("SX1262 Ra01S: OK");
@@ -758,9 +706,6 @@ void initLoRa() {
   Serial.printf("  Slot duration: %lu μs (%.2f ms)\n", Tslot_us, Tslot_us / 1000.0);
   Serial.printf("  Safety margin: %.1fx\n", (float)Tslot_us / (float)EFFECTIVE_TOA_US);
   
-  // Initialize Timer Interrupt for TDMA timing
-  Serial.println("\nInitializing Timer Interrupt...");
-  // Timer with 1 MHz frequency (ESP32 Arduino core 3.x API)
   tdmaTimer = timerBegin(1000000);  // 1 MHz = 1 microsecond resolution
   timerAttachInterrupt(tdmaTimer, &onTdmaTimer);
   // Set alarm to trigger every Tperiod_us (full TDMA cycle)
@@ -791,7 +736,6 @@ void initMyInfo() {
   Serial.print("Is Reference: "); Serial.println(IS_REFERENCE);
 }
 
-// ============= DISPLAY UPDATE (NON-BLOCKING) =============
 void updateDisplay() {
   // Non-blocking update - check if enough time has passed
   uint32_t now = millis();
@@ -930,9 +874,7 @@ void updateDisplay() {
   display.display();
 }
 
-// ============= DATA LOGGING TASK (FreeRTOS) =============
 #if ENABLE_DATA_LOG == 1
-// Runs on Core 0, processes log queue and outputs structured CSV data
 void dataLogTask(void* parameter) {
   Serial.println("[DATA_LOG_TASK] Started on Core 0");
   
@@ -964,7 +906,6 @@ void dataLogTask(void* parameter) {
 }
 #endif
 
-// Helper: Log packet data (PDR, latency, etc.)
 void logPacketData(uint16_t nodeId, uint16_t msgId, uint8_t hopCount, int64_t latencyUs, int16_t rssi, int8_t snr) {
   #if DEBUG_MODE == DEBUG_MODE_GATEWAY_ONLY
     if (logQueue == NULL) return;
@@ -986,7 +927,6 @@ void logPacketData(uint16_t nodeId, uint16_t msgId, uint8_t hopCount, int64_t la
   #endif
 }
 
-// Helper: Send WiFi event (non-blocking, queued)
 void sendWifiEvent(const char* eventType, const char* details) {
   #if ENABLE_WIFI == 1 && DEBUG_MODE == DEBUG_MODE_WIFI_MONITOR
     if (wifiEventQueue == NULL || WiFi.status() != WL_CONNECTED) return;
@@ -1003,7 +943,6 @@ void sendWifiEvent(const char* eventType, const char* details) {
   #endif
 }
 
-// Helper: Send PDR stats via WiFi (for WIFI_MONITOR mode)
 void sendPdrStatsWifi() {
   #if ENABLE_WIFI == 1 && DEBUG_MODE == DEBUG_MODE_WIFI_MONITOR && ENABLE_PDR_TRACKING == 1
     if (wifiEventQueue == NULL || WiFi.status() != WL_CONNECTED) return;
@@ -1035,7 +974,6 @@ void sendPdrStatsWifi() {
   #endif
 }
 
-// Helper: Send latency data via WiFi (for WIFI_MONITOR mode)
 void sendLatencyDataWifi(uint16_t nodeId, uint16_t msgId, uint8_t hopCount, int64_t latencyUs, int16_t rssi, int8_t snr) {
   #if ENABLE_WIFI == 1 && DEBUG_MODE == DEBUG_MODE_WIFI_MONITOR
     if (wifiEventQueue == NULL || WiFi.status() != WL_CONNECTED) return;
@@ -1052,8 +990,6 @@ void sendLatencyDataWifi(uint16_t nodeId, uint16_t msgId, uint8_t hopCount, int6
   #endif
 }
 
-// ============= WIFI MONITOR TASK (FreeRTOS) =============
-// Runs on Core 0, sends events via UDP to Python monitoring server
 #if ENABLE_WIFI == 1 && DEBUG_MODE == DEBUG_MODE_WIFI_MONITOR
 void wifiMonitorTask(void* parameter) {
   Serial.println("[WIFI_MONITOR] Task started on Core 0");
@@ -1156,8 +1092,6 @@ void wifiMonitorTask(void* parameter) {
 }
 #endif
 
-// ============= DISPLAY TASK (FreeRTOS) =============
-// Runs on Core 0, updates display at 5 Hz (200ms interval)
 void displayTask(void* parameter) {
   Serial.println("[DISPLAY_TASK] Started on Core 0");
   
@@ -1196,7 +1130,6 @@ void printStatusLine() {
                 txPacketCount, rxPacketCount, forwardQueueCount);
 }
 
-// ============= FIFO QUEUE FUNCTIONS =============
 bool enqueueForward(ForwardMessage* msg) {
   if (forwardQueueCount >= FORWARD_QUEUE_SIZE) {
     Serial.printf("[Node %d] [QUEUE] Forward queue full!\n", myInfo.id);
@@ -1224,7 +1157,6 @@ bool dequeueForward(ForwardMessage* msg) {
   return true;
 }
 
-// ============= NEXT HOP SELECTION =============
 uint16_t selectBestNextHop() {
   // Select best next hop from bidirectional neighbors
   // Priority: Good RSSI (> -100) > Low hop count > Best SNR
@@ -1293,7 +1225,6 @@ uint16_t selectBestNextHop() {
   return bestNodeId;
 }
 
-// ============= TRANSMIT FUNCTION =============
 void transmitUnifiedPacket() {
   memset(txBuffer, 0, FIXED_PACKET_LENGTH);
   
@@ -1503,7 +1434,6 @@ void transmitUnifiedPacket() {
   }
 }
 
-// Process received unified packet
 uint8_t processRxPacket() {
   uint8_t selectedNeighbourIdx = 0;
   
@@ -2067,10 +1997,6 @@ uint8_t processRxPacket() {
   return senderSlot;
 }
 
-// ============= NEIGHBOR STATUS UPDATE =============
-// ============= RE-CALCULATE HOP COUNT =============
-// Re-calculate hop distance using Bellman-Ford algorithm
-// Called every cycle in processing phase
 void recalculateHopCount() {
   #if IS_REFERENCE == 0  // Only non-gateway nodes
     uint8_t oldHop = myInfo.hoppingDistance;
@@ -2167,8 +2093,6 @@ void updateNeighbourStatus() {
   }
 }
 
-// ============= RESPONDER FUNCTION (RX with timeout) =============
-// Ra01S version: Uses polling instead of callbacks
 ResponderOutput responder(uint32_t timeoutMs) {
   ResponderOutput output;
   output.senderSlot = 255;
@@ -2229,18 +2153,14 @@ ResponderOutput responder(uint32_t timeoutMs) {
   return output;
 }
 
-// ============= SETUP =============
 void setup() {
   Serial.begin(115200);
   delay(1000);
   Serial.println("\n=== LoRa Mesh Node (Ra01S Library) ===");
   
-  // ============= LOAD CONFIG FROM EEPROM =============
-  configInit();  // Initialize EEPROM
-  
+  configInit();
   runtimeConfig = configLoad();
   if (runtimeConfig.valid) {
-    // Use EEPROM config
     strncpy(activeSSID, runtimeConfig.ssid, MAX_SSID_LEN);
     strncpy(activePassword, runtimeConfig.password, MAX_PASS_LEN);
     strncpy(activeServerIP, runtimeConfig.serverIP, MAX_IP_LEN);
@@ -2248,13 +2168,11 @@ void setup() {
     configLoaded = true;
     Serial.println("[CONFIG] Loaded from EEPROM");
   } else {
-    // Use defaults from settings.h
     strncpy(activeSSID, WIFI_SSID, MAX_SSID_LEN);
     strncpy(activePassword, WIFI_PASS, MAX_PASS_LEN);
     strncpy(activeServerIP, SERVER_IP, MAX_IP_LEN);
     activeDebugMode = DEBUG_MODE;
     
-    // Initialize runtime config with defaults
     strncpy(runtimeConfig.ssid, WIFI_SSID, MAX_SSID_LEN);
     strncpy(runtimeConfig.password, WIFI_PASS, MAX_PASS_LEN);
     strncpy(runtimeConfig.serverIP, SERVER_IP, MAX_IP_LEN);
@@ -2269,13 +2187,12 @@ void setup() {
   Serial.printf("[CONFIG] Mode: %d\n", activeDebugMode);
   Serial.println("[CONFIG] Type 'HELP' for serial commands");
   
-  // Initialize I2C
   Wire.begin(I2C_SDA, I2C_SCL);
   Serial.printf("I2C initialized - SDA:%d SCL:%d\n", I2C_SDA, I2C_SCL);
   
-  // Initialize components
   initEncoder();
   initDisplay();
+  initSensors();
   initLoRa();
   initMyInfo();
   
@@ -2418,7 +2335,6 @@ void setup() {
   strcpy(nodeStatus, "READY");
 }
 
-// ============= TDMA STATE RESET FUNCTION =============
 void resetTDMAState() {
   // Clear all neighbors
   for (uint8_t i = 0; i < MAX_NEIGHBOURS; i++) {
@@ -2456,30 +2372,9 @@ void resetTDMAState() {
   lastReceivedCycle = -1;
   autoSendCounter = 0;
   
-  // Reset visualization sync (not real protocol)
-  
-  // NOTE: NTP time is PRESERVED (no reboot!)
-  // timeSynced, ntpEpochAtSync, microsAtSync unchanged
-  
   Serial.printf("{NODE%d} [RESET] All TDMA state cleared (neighbors=%d, hop=%d)\n", 
                 myInfo.id, neighbourCount, myInfo.hoppingDistance);
 }
-
-// ============= SERIAL COMMAND HANDLER =============
-// Commands processed during processing phase to avoid TDMA interference
-// EEPROM Commands (require reboot):
-//   SET_SSID <ssid>       - Set WiFi SSID
-//   SET_PASS <password>   - Set WiFi password  
-//   SET_SERVER <ip>       - Set server IP
-//   SET_MODE <0/1/2>      - Set debug mode
-//   SAVE                  - Save current config and reboot
-//   RESET_CONFIG          - Clear EEPROM, use defaults (reboots)
-//   SHOW                  - Show current configuration
-// TDMA Commands (no reboot, no save):
-//   TDMA_ON               - Enable TDMA
-//   TDMA_OFF              - Disable TDMA and reset all data
-//   STATUS                - Show current status
-//   HELP                  - Show available commands
 
 void checkSerialCommands() {
   // Quick non-blocking check - limit processing time
@@ -2652,20 +2547,17 @@ void checkSerialCommands() {
   }
 }
 
-// ============= MAIN LOOP =============
 void loop() {
-  // Check for serial commands (STOP, START, status, etc.)
+  updateSensorReadings();
   checkSerialCommands();
   
   ResponderOutput rxOutput;
   
-  // BUTTON HANDLING
   noInterrupts();
   bool btnPressed = buttonPressed;
   buttonPressed = false;
   interrupts();
   
-  // GATEWAY: Increment synchronized cycle counter
   #if IS_REFERENCE == 1
     autoSendCounter++;
     if (autoSendCounter >= AUTO_SEND_INTERVAL_CYCLES) {
@@ -2674,9 +2566,6 @@ void loop() {
     myInfo.syncedCycle = autoSendCounter;
   #endif
   
-  // ============= STRATUM TIMEOUT CHECK (5-CYCLE DEGRADATION) =============
-  // Non-gateway nodes: Decrement sync validity counter each cycle
-  // When counter reaches 0, degrade stratum to LOCAL (not synced)
   #if IS_REFERENCE == 0
   {
     static uint8_t lastCycleForStratum = 255;
@@ -2729,13 +2618,8 @@ void loop() {
       }
       
       if (hasNextHop) {
-        simTemperature = 25.0 + (random(-50, 50) / 10.0);
-        simHumidity = 60.0 + (random(-100, 100) / 10.0);
-        int newBattery = (int)simBattery - (int)random(0, 2);
-        simBattery = (uint8_t)constrain(newBattery, 0, 100);
-        
-        snprintf(sensorDataToSend, sizeof(sensorDataToSend), "T%.0fH%d", 
-                 simTemperature, simBattery);
+        snprintf(sensorDataToSend, sizeof(sensorDataToSend), "T%.1fH%.0f%%B%d%%", 
+                 currentTemperature, currentHumidity, currentBattery);
         
         messageIdCounter++;
         ownMessageOrigSender = myInfo.id;
@@ -2743,8 +2627,8 @@ void loop() {
         
         hasSensorDataToSend = true;
         
-        Serial.printf("[Node %d] [AUTO_SEND_SEQ] 🔄 My turn! Cycle:%d (ID:%d) MsgID:%u T:%.1f B:%d%% data:%s\n", 
-                      myInfo.id, myInfo.syncedCycle, myInfo.id, ownMessageId, simTemperature, simBattery, sensorDataToSend);
+        Serial.printf("[Node %d] [AUTO_SEND_SEQ] 🔄 My turn! Cycle:%d (ID:%d) MsgID:%u T:%.1f H:%.1f B:%d%% data:%s\n", 
+                      myInfo.id, myInfo.syncedCycle, myInfo.id, ownMessageId, currentTemperature, currentHumidity, currentBattery, sensorDataToSend);
       }
     }
   } else if (!cycleValidated && myInfo.hoppingDistance != 0 && myInfo.hoppingDistance != 0x7F) {
@@ -2753,13 +2637,10 @@ void loop() {
                   myInfo.id, cycleValidationCount, CYCLE_VALIDATION_THRESHOLD);
   }
   
-  // BUTTON HANDLER (Manual Send)
   if (btnPressed) {
     if (myInfo.hoppingDistance != 0 && myInfo.hoppingDistance != 0x7F) {
-      simTemperature = 25.0 + (random(-50, 50) / 10.0);
-      
-      snprintf(sensorDataToSend, sizeof(sensorDataToSend), "T%.0fH%d", 
-               simTemperature, simBattery);
+      snprintf(sensorDataToSend, sizeof(sensorDataToSend), "T%.1fH%.0f%%B%d%%", 
+               currentTemperature, currentHumidity, currentBattery);
       
       messageIdCounter++;
       ownMessageOrigSender = myInfo.id;
