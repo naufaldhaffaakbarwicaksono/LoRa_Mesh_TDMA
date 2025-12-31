@@ -65,4 +65,41 @@ bin/
 obj/
 
 # Private configuration files (contains WiFi credentials and server info)
-settings.h
+firmware/settings.h
+
+# Data collection and analysis outputs
+data_collection/*.csv
+data_collection/*.png
+data_collection/*.json
+*.csv
+*.png
+*.json
+
+# Exception: Keep example/documentation images
+!docs/**/*.png
+!examples/**/*.png
+!images/**/*.png
+!README*.png
+!**/example*.png
+!**/sample*.png
+
+# Visualization outputs
+tdma_timeline.png
+tdma_viz_data*.csv
+topology_*.png
+latency_*.png
+routing_*.png
+timeline_*.png
+
+# WiFi monitoring data
+wifi_events*.csv
+wifi_monitor_*.log
+
+# Python virtual environment
+venv/
+env/
+.env
+
+# Jupyter notebooks
+.ipynb_checkpoints/
+*.ipynb
