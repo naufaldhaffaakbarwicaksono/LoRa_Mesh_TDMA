@@ -46,7 +46,8 @@ Adafruit_INA219 ina219;
 #if ENABLE_WIFI == 1
   bool timeSynced = false;
   int64_t ntpEpochAtSync = 0;
-  uint64_t microsAtSync = 0;
+  uint32_t lastMicrosReading = 0;   // Last raw micros() value for overflow detection
+  uint64_t totalElapsedUs = 0;      // Total elapsed since sync (64-bit, no overflow)
   int32_t driftPpm = 0;
   uint64_t lastDriftCheck = 0;
 #endif
@@ -109,7 +110,12 @@ volatile uint32_t lastButtonISR = 0;
 const uint32_t ENCODER_DEBOUNCE_US = 500;
 const uint32_t BUTTON_DEBOUNCE_MS = 150;
 
-#define RSSI_THRESHOLD_DBM -115
+// RSSI Configuration (runtime adjustable via serial)
+int16_t rssiThresholdDbm = -100;     // Minimum RSSI to accept packet/neighbor
+int16_t rssiGoodQualityDbm = -95;   // "Good quality" threshold for hop selection priority
+
+// TX Power Configuration (runtime adjustable via serial, SX1262 range: -9 to +22 dBm)
+int8_t currentTxPower = TX_OUTPUT_POWER;  // Initialize from settings.h default
 
 NeighbourInfo neighbours[MAX_NEIGHBOURS];
 uint8_t neighbourIndices[MAX_NEIGHBOURS];
@@ -135,8 +141,8 @@ struct ForwardMessage {
   uint8_t dataLen;
   char data[SENSOR_DATA_LENGTH + 1];
   uint16_t tracking[MAX_TRACKING_HOPS];
-  #if ENABLE_WIFI == 1 && ENABLE_LATENCY_CALC == 1
-    int64_t txTimestampUs;
+  #if ENABLE_LATENCY_CALC == 1
+    int64_t txTimestampUs;  // TX timestamp (works even after WiFi disconnect)
   #endif
 };
 ForwardMessage forwardQueue[FORWARD_QUEUE_SIZE];
@@ -148,7 +154,8 @@ uint16_t messageIdCounter = 0;
 uint16_t ownMessageOrigSender = 0;
 uint16_t ownMessageId = 0;
 
-#if (ENABLE_WIFI == 1 && ENABLE_LATENCY_CALC == 1) || (ENABLE_WIFI == 1 && DEBUG_MODE == DEBUG_MODE_WIFI_MONITOR)
+// Latency tracking - enabled when ENABLE_LATENCY_CALC=1 (works after WiFi disconnect using stored NTP time)
+#if ENABLE_LATENCY_CALC == 1
   #ifndef LATENCY_CACHE_SIZE
     #define LATENCY_CACHE_SIZE 20
   #endif
@@ -212,6 +219,22 @@ uint16_t ownMessageId = 0;
   uint32_t totalPacketsLost = 0;
   float networkPdr = 100.0;
 #endif
+
+// ============= ROUTING STATISTICS =============
+// Track routing paths for display (Primary vs Alternative routes)
+RouteStats routeStats[MAX_ROUTE_STATS];
+uint8_t routeStatsCount = 0;
+
+// Node-level: track own transmissions
+uint32_t txToPrimary = 0;          // Packets sent to primary route (direct to GW or lowest hop neighbor)
+uint32_t txToAlternative = 0;      // Packets sent to alternative route (relay node)
+uint16_t primaryNextHop = 0;       // Primary next hop node ID
+uint16_t alternativeNextHop = 0;   // Alternative next hop node ID
+
+// Function declarations for routing
+void updateRouteStats(uint16_t fromNode, uint16_t toNode, uint8_t routeType);
+void updateOwnRouteStats(uint16_t nextHop);  // Primary/Alternative determined by packet count
+int8_t findRouteStatsIndex(uint16_t fromNode, uint16_t toNode);
 
 #define WIFI_BATCH_SIZE 10
 struct WifiMessage {
@@ -319,23 +342,45 @@ void updateNodeLatency(uint16_t nodeId, int64_t latencyUs);
 #endif
 
 #if ENABLE_WIFI == 1
+// Update elapsed time (call frequently to detect overflow)
+void updateElapsedTime() {
+  if (!timeSynced) return;
+  
+  uint32_t currentMicros = micros();
+  
+  // Detect overflow: if current < last, micros() wrapped around
+  if (currentMicros < lastMicrosReading) {
+    // Overflow occurred - add the remaining time before overflow + time after
+    uint32_t beforeOverflow = 0xFFFFFFFF - lastMicrosReading;
+    totalElapsedUs += beforeOverflow + currentMicros + 1;
+    
+    #if DEBUG_MODE == DEBUG_MODE_GATEWAY_ONLY
+      Serial.printf("[TIME] micros() overflow detected! Total elapsed: %llu us\n", totalElapsedUs);
+    #endif
+  } else {
+    // Normal case - add delta
+    totalElapsedUs += (currentMicros - lastMicrosReading);
+  }
+  
+  lastMicrosReading = currentMicros;
+}
+
 int64_t getCurrentTimeUs() {
   if (!timeSynced) return 0;
   
-  // Calculate elapsed time since last NTP sync
-  uint64_t currentMicros = micros();
-  uint64_t elapsedUs = currentMicros - microsAtSync;
+  // Update elapsed time (handles overflow)
+  updateElapsedTime();
   
   #if ENABLE_DRIFT_COMPENSATION == 1
     // Apply drift compensation (safe calculation to prevent overflow)
     // driftCorrection = elapsed * (driftPpm / 1000000)
     // Split to prevent overflow: (elapsed / 1000) * driftPpm / 1000
-    int64_t elapsedMs = elapsedUs / 1000;  // Convert to milliseconds first
+    int64_t elapsedMs = totalElapsedUs / 1000;  // Convert to milliseconds first
     int64_t driftCorrectionUs = (elapsedMs * driftPpm) / 1000;
     
-    return ntpEpochAtSync + elapsedUs + driftCorrectionUs;
+    return ntpEpochAtSync + totalElapsedUs + driftCorrectionUs;
   #else
-    return ntpEpochAtSync + elapsedUs;
+    return ntpEpochAtSync + totalElapsedUs;
   #endif
 }
 
@@ -354,12 +399,12 @@ void updateDriftCompensation() {
       
       // Calculate drift only over this interval (prevents unbounded growth)
       int64_t driftUs = ntpCurrentUs - ourTimeUs;
-      uint64_t intervalUs = micros() - microsAtSync;
       
-      if (intervalUs > 1000000) {  // At least 1 second elapsed
+      // Use totalElapsedUs for interval calculation (overflow-safe)
+      if (totalElapsedUs > 1000000) {  // At least 1 second elapsed
         // Calculate PPM: drift_ppm = (drift / interval) * 1000000
         // Use milliseconds to prevent overflow
-        int64_t intervalMs = intervalUs / 1000;
+        int64_t intervalMs = totalElapsedUs / 1000;
         int64_t driftMs = driftUs / 1000;
         int32_t newDriftPpm = (int32_t)((driftMs * 1000000LL) / intervalMs);
         
@@ -373,11 +418,12 @@ void updateDriftCompensation() {
         }
         
         Serial.printf("[TIME] Drift: %lld μs over %llu s, PPM: %ld\n", 
-                      driftUs, intervalUs/1000000, driftPpm);
+                      driftUs, totalElapsedUs/1000000, driftPpm);
         
         // RE-SYNC: Reset reference point to prevent unbounded growth
         ntpEpochAtSync = ntpCurrentUs;
-        microsAtSync = micros();
+        lastMicrosReading = micros();
+        totalElapsedUs = 0;  // Reset elapsed counter after re-sync
       }
       
       lastDriftCheck = now;
@@ -535,6 +581,120 @@ void updateNodeLatency(uint16_t nodeId, int64_t latencyUs) {
 }
 #endif
 
+// ============= ROUTING STATISTICS FUNCTIONS =============
+// Find route stats entry index, returns -1 if not found
+int8_t findRouteStatsIndex(uint16_t fromNode, uint16_t toNode) {
+  for (uint8_t i = 0; i < routeStatsCount; i++) {
+    if (routeStats[i].active && 
+        routeStats[i].fromNode == fromNode && 
+        routeStats[i].toNode == toNode) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+// Update route statistics (called when receiving packets at gateway)
+void updateRouteStats(uint16_t fromNode, uint16_t toNode, uint8_t routeType) {
+  int8_t idx = findRouteStatsIndex(fromNode, toNode);
+  
+  if (idx >= 0) {
+    // Update existing entry
+    routeStats[idx].packetCount++;
+    routeStats[idx].lastUpdateTime = millis();
+    // Update route type if it changed (alternative might become primary)
+    if (routeType == ROUTE_TYPE_PRIMARY && routeStats[idx].routeType == ROUTE_TYPE_ALTERNATIVE) {
+      routeStats[idx].routeType = ROUTE_TYPE_PRIMARY;
+    }
+  } else if (routeStatsCount < MAX_ROUTE_STATS) {
+    // Add new entry
+    routeStats[routeStatsCount].fromNode = fromNode;
+    routeStats[routeStatsCount].toNode = toNode;
+    routeStats[routeStatsCount].routeType = routeType;
+    routeStats[routeStatsCount].packetCount = 1;
+    routeStats[routeStatsCount].lastUpdateTime = millis();
+    routeStats[routeStatsCount].active = true;
+    routeStatsCount++;
+    
+    DEBUG_PRINT("[ROUTE] New route: %d->%d (%c)\n", 
+                fromNode, toNode, routeType == ROUTE_TYPE_PRIMARY ? 'P' : 'A');
+  }
+}
+
+// Update own node's route statistics (called when transmitting)
+void updateOwnRouteStats(uint16_t nextHop) {
+  // Track packet count per next hop to determine Primary vs Alternative
+  if (nextHop == 0) return;
+  
+  // Find or create route entry for this next hop
+  int8_t idx = -1;
+  for (uint8_t i = 0; i < routeStatsCount; i++) {
+    if (routeStats[i].active && 
+        routeStats[i].fromNode == myInfo.id && 
+        routeStats[i].toNode == nextHop) {
+      idx = i;
+      break;
+    }
+  }
+  
+  if (idx >= 0) {
+    // Update existing entry
+    routeStats[idx].packetCount++;
+    routeStats[idx].lastUpdateTime = millis();
+  } else if (routeStatsCount < MAX_ROUTE_STATS) {
+    // Add new entry
+    routeStats[routeStatsCount].fromNode = myInfo.id;
+    routeStats[routeStatsCount].toNode = nextHop;
+    routeStats[routeStatsCount].routeType = ROUTE_TYPE_PRIMARY;  // Will be recalculated
+    routeStats[routeStatsCount].packetCount = 1;
+    routeStats[routeStatsCount].lastUpdateTime = millis();
+    routeStats[routeStatsCount].active = true;
+    routeStatsCount++;
+  }
+  
+  // Recalculate Primary/Alternative based on packet count
+  // Find max packet count among own routes
+  uint32_t maxPackets = 0;
+  for (uint8_t i = 0; i < routeStatsCount; i++) {
+    if (routeStats[i].active && routeStats[i].fromNode == myInfo.id) {
+      if (routeStats[i].packetCount > maxPackets) {
+        maxPackets = routeStats[i].packetCount;
+      }
+    }
+  }
+  
+  // Update route types: highest packet count = Primary, others = Alternative
+  for (uint8_t i = 0; i < routeStatsCount; i++) {
+    if (routeStats[i].active && routeStats[i].fromNode == myInfo.id) {
+      if (routeStats[i].packetCount == maxPackets) {
+        routeStats[i].routeType = ROUTE_TYPE_PRIMARY;
+      } else {
+        routeStats[i].routeType = ROUTE_TYPE_ALTERNATIVE;
+      }
+    }
+  }
+  
+  // Update summary counters for display
+  txToPrimary = 0;
+  txToAlternative = 0;
+  primaryNextHop = 0;
+  alternativeNextHop = 0;
+  
+  for (uint8_t i = 0; i < routeStatsCount; i++) {
+    if (routeStats[i].active && routeStats[i].fromNode == myInfo.id) {
+      if (routeStats[i].routeType == ROUTE_TYPE_PRIMARY) {
+        txToPrimary += routeStats[i].packetCount;
+        primaryNextHop = routeStats[i].toNode;
+      } else {
+        txToAlternative += routeStats[i].packetCount;
+        if (alternativeNextHop == 0) {
+          alternativeNextHop = routeStats[i].toNode;
+        }
+      }
+    }
+  }
+}
+
 void IRAM_ATTR encoderISR() {
   uint32_t now = micros();
   if (now - lastEncoderISR < ENCODER_DEBOUNCE_US) return;
@@ -564,7 +724,7 @@ void IRAM_ATTR buttonISR() {
   
   if (digitalRead(ENCODER_SW) == LOW) {
     buttonPressed = true;
-    // Cycle through display pages
+    // Cycle through display pages (simple modulo, pages are now properly numbered)
     currentPage = (currentPage + 1) % DISPLAY_PAGE_COUNT;
     displayNeedsUpdate = true;
   }
@@ -664,7 +824,7 @@ void initLoRa() {
   // begin(frequency, txPower, tcxoVoltage, useRegulatorLDO)
   // tcxoVoltage = 0.0 means no TCXO
   // useRegulatorLDO = false means use DC-DC regulator
-  int16_t result = radio.begin(RF_FREQUENCY, TX_OUTPUT_POWER, 0.0, false);
+  int16_t result = radio.begin(RF_FREQUENCY, currentTxPower, 0.0, false);
   
   if (result != ERR_NONE) {
     Serial.printf("[ERROR] SX1262 init failed! Error: %d\n", result);
@@ -691,7 +851,7 @@ void initLoRa() {
   
   Serial.println("LoRa configured:");
   Serial.printf("  Frequency: %.1f MHz\n", RF_FREQUENCY / 1000000.0);
-  Serial.printf("  TX Power: %d dBm\n", TX_OUTPUT_POWER);
+  Serial.printf("  TX Power: %d dBm\n", currentTxPower);
   Serial.printf("  SF: %d\n", LORA_SPREADING_FACTOR);
   Serial.printf("  BW: %s\n", 
                 (LORA_BANDWIDTH == SX126X_LORA_BW_125_0) ? "125kHz" :
@@ -730,6 +890,17 @@ void initMyInfo() {
   #else
     myInfo.slotIndex = random(0, Nslot);
   #endif
+  
+  // Initialize route statistics
+  for (uint8_t i = 0; i < MAX_ROUTE_STATS; i++) {
+    routeStats[i].active = false;
+    routeStats[i].packetCount = 0;
+  }
+  routeStatsCount = 0;
+  txToPrimary = 0;
+  txToAlternative = 0;
+  primaryNextHop = 0;
+  alternativeNextHop = 0;
   
   Serial.print("Node ID: "); Serial.println(myInfo.id);
   Serial.print("Slot Index: "); Serial.println(myInfo.slotIndex);
@@ -792,7 +963,39 @@ void updateDisplay() {
     display.println(statsLine);
   }
   
-  // ========== PAGE 1: PER-NODE STATISTICS (GATEWAY ONLY) ==========
+  // ========== PAGE 1: SENSOR DATA & BATTERY ==========
+  else if (currentPage == DISPLAY_PAGE_SENSOR) {
+    display.println("== SENSOR & BATTERY ==");
+    
+    // Temperature
+    display.print("Temp: ");
+    display.print(currentTemperature, 1);
+    display.println(" C");
+    
+    // Humidity
+    display.print("Humidity: ");
+    display.print(currentHumidity, 1);
+    display.println(" %");
+    
+    // Battery voltage
+    display.print("Voltage: ");
+    display.print(currentVoltage, 2);
+    display.println(" V");
+    
+    // Battery percentage
+    display.print("Battery: ");
+    display.print(currentBattery);
+    display.println(" %");
+    
+    // Page indicator
+    display.setCursor(0, 56);
+    display.print("[Sensor] P");
+    display.print(currentPage + 1);
+    display.print("/");
+    display.print(DISPLAY_PAGE_COUNT);
+  }
+  
+  // ========== PAGE 2: PER-NODE STATISTICS (GATEWAY ONLY) ==========
   #if ENABLE_PDR_TRACKING == 1
   else if (currentPage == DISPLAY_PAGE_PDR) {
     display.println("== NODE STATS ==");
@@ -848,8 +1051,101 @@ void updateDisplay() {
   }
   #endif
   
-  // ========== PAGE 2: WIFI INFO (WIFI_MONITOR MODE ONLY) ==========
-  #if DEBUG_MODE == DEBUG_MODE_WIFI_MONITOR && ENABLE_WIFI == 1
+  // ========== PAGE 3: ROUTING STATISTICS ==========
+  else if (currentPage == DISPLAY_PAGE_ROUTING) {
+    display.println("== ROUTING ==");
+    
+    #if IS_REFERENCE == 1
+      // Gateway: Show route summary (page 1 of 2)
+      if (routeStatsCount == 0) {
+        display.setCursor(0, 16);
+        display.println("No routes yet");
+      } else {
+        // Show up to 6 routes on this page
+        uint8_t shown = 0;
+        for (uint8_t i = 0; i < routeStatsCount && shown < 6; i++) {
+          if (routeStats[i].active) {
+            char line[22];
+            char routeChar = (routeStats[i].routeType == ROUTE_TYPE_PRIMARY) ? 'P' : 'A';
+            // Format: fromNode->toNode (P/A) count
+            if (routeStats[i].toNode == myInfo.id || routeStats[i].toNode == 1) {
+              snprintf(line, sizeof(line), "%d->GW (%c) %lu",
+                       routeStats[i].fromNode, routeChar, routeStats[i].packetCount);
+            } else {
+              snprintf(line, sizeof(line), "%d->%d (%c) %lu",
+                       routeStats[i].fromNode, routeStats[i].toNode, routeChar, routeStats[i].packetCount);
+            }
+            display.println(line);
+            shown++;
+          }
+        }
+      }
+    #else
+      // Node: Show own routing info
+      display.printf("Node %d Routing:\n", myInfo.id);
+      
+      if (myInfo.hoppingDistance == 0x7F) {
+        display.println("Not synced to GW");
+      } else if (myInfo.hoppingDistance == 1) {
+        // Direct to gateway
+        display.printf("%d->GW (P) %lu\n", myInfo.id, txToPrimary);
+      } else {
+        // Multi-hop: show primary and alternative routes
+        if (primaryNextHop > 0) {
+          display.printf("%d->%d (P) %lu\n", myInfo.id, primaryNextHop, txToPrimary);
+        }
+        if (alternativeNextHop > 0 && alternativeNextHop != primaryNextHop) {
+          display.printf("%d->%d (A) %lu\n", myInfo.id, alternativeNextHop, txToAlternative);
+        }
+      }
+    #endif
+    
+    display.setCursor(0, 56);
+    display.print("[Routing] P");
+    display.print(DISPLAY_PAGE_ROUTING + 1);
+    display.print("/");
+    display.print(DISPLAY_PAGE_COUNT);
+  }
+  
+  // ========== ROUTING PAGE 2 (GATEWAY ONLY) ==========
+  #if DISPLAY_PAGE_ROUTING2 != 255
+  else if (currentPage == DISPLAY_PAGE_ROUTING2) {
+    display.println("== ROUTING P2 ==");
+    
+    if (routeStatsCount <= 6) {
+      display.setCursor(0, 16);
+      display.println("See page 3 for all");
+      display.println("routes");
+    } else {
+      // Show routes 7-12 (index 6-11)
+      uint8_t shown = 0;
+      for (uint8_t i = 6; i < routeStatsCount && shown < 6; i++) {
+        if (routeStats[i].active) {
+          char line[22];
+          char routeChar = (routeStats[i].routeType == ROUTE_TYPE_PRIMARY) ? 'P' : 'A';
+          if (routeStats[i].toNode == myInfo.id || routeStats[i].toNode == 1) {
+            snprintf(line, sizeof(line), "%d->GW (%c) %lu",
+                     routeStats[i].fromNode, routeChar, routeStats[i].packetCount);
+          } else {
+            snprintf(line, sizeof(line), "%d->%d (%c) %lu",
+                     routeStats[i].fromNode, routeStats[i].toNode, routeChar, routeStats[i].packetCount);
+          }
+          display.println(line);
+          shown++;
+        }
+      }
+    }
+    
+    display.setCursor(0, 56);
+    display.print("[Route P2] P");
+    display.print(DISPLAY_PAGE_ROUTING2 + 1);
+    display.print("/");
+    display.print(DISPLAY_PAGE_COUNT);
+  }
+  #endif
+  
+  // ========== WIFI INFO PAGE (WIFI_MONITOR MODE ONLY) ==========
+  #if DISPLAY_PAGE_WIFI != 255
   else if (currentPage == DISPLAY_PAGE_WIFI) {
     display.println("== WIFI MONITOR ==");
     if (WiFi.status() == WL_CONNECTED) {
@@ -862,19 +1158,118 @@ void updateDisplay() {
       display.println(activeServerIP);
     } else {
       display.println("Status: Disconnected");
-      display.println("Reconnecting...");
+      #if DEBUG_MODE == DEBUG_MODE_WIFI_MONITOR
+        display.println("Reconnecting...");
+      #else
+        display.println("(NTP only mode)");
+      #endif
     }
     
     display.setCursor(0, 56);
-    display.print("[WiFi Info] P3/");
+    display.print("[WiFi] P");
+    display.print(DISPLAY_PAGE_WIFI + 1);
+    display.print("/");
     display.print(DISPLAY_PAGE_COUNT);
   }
   #endif
   
+  // ========== TIME PAGE (LAST PAGE) ==========
+  else if (currentPage == DISPLAY_PAGE_TIME) {
+    #if IS_REFERENCE == 1
+      // Gateway: Show WiFi info + Time
+      display.println("== GW INFO ==");
+      
+      #if ENABLE_WIFI == 1
+        if (WiFi.status() == WL_CONNECTED) {
+          display.printf("WiFi: %s\n", activeSSID);
+          display.printf("IP: %s\n", WiFi.localIP().toString().c_str());
+          display.printf("GW: %s\n", WiFi.gatewayIP().toString().c_str());
+        } else {
+          display.println("WiFi: Disconnected");
+        }
+        
+        if (timeSynced) {
+          int64_t currentTimeUs = getCurrentTimeUs();
+          int64_t timeSec = currentTimeUs / 1000000LL;
+          struct tm timeinfo;
+          time_t timeSec_t = (time_t)timeSec;
+          localtime_r(&timeSec_t, &timeinfo);
+          display.printf("%02d:%02d:%02d NTP OK\n",
+                   timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+        } else {
+          display.println("NTP: Not synced");
+        }
+      #else
+        display.println("WiFi: Disabled");
+      #endif
+    #else
+      // Node: Show Time (+ WiFi info only in WIFI_MONITOR mode)
+      #if DEBUG_MODE == DEBUG_MODE_WIFI_MONITOR
+        display.println("== NODE INFO ==");
+        
+        #if ENABLE_WIFI == 1
+          if (WiFi.status() == WL_CONNECTED) {
+            display.printf("WiFi: %s\n", activeSSID);
+            display.printf("IP: %s\n", WiFi.localIP().toString().c_str());
+          } else {
+            display.println("WiFi: Disconnected");
+          }
+        #endif
+        
+        if (timeSynced) {
+          int64_t currentTimeUs = getCurrentTimeUs();
+          int64_t timeSec = currentTimeUs / 1000000LL;
+          struct tm timeinfo;
+          time_t timeSec_t = (time_t)timeSec;
+          localtime_r(&timeSec_t, &timeinfo);
+          display.printf("%02d:%02d:%02d NTP OK\n",
+                   timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+        } else {
+          display.println("NTP: Not synced");
+        }
+      #else
+        // Non-WIFI_MONITOR: Show time only
+        display.println("== TIME ==");
+        
+        #if ENABLE_WIFI == 1
+          if (timeSynced) {
+            int64_t currentTimeUs = getCurrentTimeUs();
+            int64_t timeSec = currentTimeUs / 1000000LL;
+            int64_t microPart = currentTimeUs % 1000000LL;
+            
+            struct tm timeinfo;
+            time_t timeSec_t = (time_t)timeSec;
+            localtime_r(&timeSec_t, &timeinfo);
+            
+            display.printf("%04d-%02d-%02d\n",
+                     timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday);
+            display.printf("%02d:%02d:%02d.%03d\n",
+                     timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec, (int)(microPart / 1000));
+            display.println("NTP: Synced");
+            uint64_t elapsedSec = totalElapsedUs / 1000000;  // Overflow-safe
+            display.printf("Elapsed: %llu s\n", elapsedSec);
+          } else {
+            display.println("\nNTP: Not synced");
+            display.printf("Uptime: %lu s\n", millis() / 1000);
+          }
+        #else
+          display.println("\nWiFi disabled");
+          display.printf("Uptime: %lu s\n", millis() / 1000);
+        #endif
+      #endif
+    #endif
+    
+    display.setCursor(0, 56);
+    display.print("[Time] P");
+    display.print(DISPLAY_PAGE_TIME + 1);
+    display.print("/");
+    display.print(DISPLAY_PAGE_COUNT);
+  }
+  
   display.display();
 }
 
-#if ENABLE_DATA_LOG == 1
+#if DEBUG_MODE == DEBUG_MODE_GATEWAY_ONLY
 void dataLogTask(void* parameter) {
   Serial.println("[DATA_LOG_TASK] Started on Core 0");
   
@@ -906,24 +1301,101 @@ void dataLogTask(void* parameter) {
 }
 #endif
 
+// Helper: Build routing path string from tracking array
+void buildRoutePath(uint16_t* tracking, uint8_t hopCount, char* pathStr, size_t pathSize) {
+  pathStr[0] = '\0';
+  for (uint8_t i = 0; i < hopCount && i < MAX_TRACKING_HOPS; i++) {
+    if (tracking[i] > 0) {
+      char nodeStr[8];
+      snprintf(nodeStr, sizeof(nodeStr), "%d", tracking[i]);
+      strcat(pathStr, nodeStr);
+      if (i < hopCount - 1) strcat(pathStr, " > ");
+    }
+  }
+  strcat(pathStr, " > GW");
+}
+
+// Helper: Format short timestamp (HH:MM:SS.mmm)
+void formatTimeShort(int64_t timeUs, char* buffer, size_t bufSize) {
+  #if ENABLE_WIFI == 1
+    if (!timeSynced || timeUs == 0) {
+      snprintf(buffer, bufSize, "--:--:--.---");
+      return;
+    }
+    int64_t timeSec = timeUs / 1000000LL;
+    int64_t milliPart = (timeUs % 1000000LL) / 1000;
+    struct tm timeinfo;
+    time_t timeSec_t = (time_t)timeSec;
+    localtime_r(&timeSec_t, &timeinfo);
+    snprintf(buffer, bufSize, "%02d:%02d:%02d.%03lld", 
+             timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec, milliPart);
+  #else
+    snprintf(buffer, bufSize, "--:--:--.---");
+  #endif
+}
+
+// Log 3 human-readable messages for each received data packet at gateway
+#if DEBUG_MODE == DEBUG_MODE_GATEWAY_ONLY
+void logGatewayPacketInfo(uint16_t origSender, uint16_t msgId, uint8_t hopCount, 
+                          uint16_t* tracking, int64_t txTimestampUs, int64_t rxTimestampUs,
+                          int64_t latencyUs, int16_t rssi, int8_t snr) {
+  
+  // Build route path string
+  char routePath[64];
+  buildRoutePath(tracking, hopCount, routePath, sizeof(routePath));
+  
+  // Get PDR stats for this sender
+  float nodePdr = 0.0;
+  uint16_t rxCount = 0, expectedCount = 0;
+  #if ENABLE_PDR_TRACKING == 1
+    for (uint8_t i = 0; i < pdrNodeCount; i++) {
+      if (pdrStats[i].nodeId == origSender) {
+        nodePdr = pdrStats[i].pdr;
+        rxCount = pdrStats[i].receivedCount;
+        expectedCount = pdrStats[i].expectedCount;
+        break;
+      }
+    }
+  #endif
+  
+  // Format timestamps
+  char txTimeStr[16], rxTimeStr[16];
+  formatTimeShort(txTimestampUs, txTimeStr, sizeof(txTimeStr));
+  formatTimeShort(rxTimestampUs, rxTimeStr, sizeof(rxTimeStr));
+  
+  // ════════════════════════════════════════════════════════════════════════
+  // Clear human-readable log format for data analysis
+  // Each packet generates 3 log lines + separator
+  // ════════════════════════════════════════════════════════════════════════
+  
+  // LOG 1: ROUTING - Who sent, which path
+  Serial.printf("[ROUTE] Node%d | MsgID:%d | Path: %s | Hops:%d | RSSI:%d SNR:%d\n",
+                origSender, msgId, routePath, hopCount, rssi, snr);
+  
+  // LOG 2: PDR - Packet Delivery Ratio
+  Serial.printf("[PDR]   Node%d | RX:%d/%d | PDR:%.1f%% | NetworkPDR:%.1f%%\n",
+                origSender, rxCount, expectedCount, nodePdr, networkPdr);
+  
+  // LOG 3: LATENCY - TX time, RX time, end-to-end delay
+  if (latencyUs >= 0) {
+    double latencyMs = latencyUs / 1000.0;
+    Serial.printf("[LAT]   Node%d | TX:%s | RX:%s | E2E:%.2fms\n",
+                  origSender, txTimeStr, rxTimeStr, latencyMs);
+  } else {
+    Serial.printf("[LAT]   Node%d | TX:N/A | RX:%s | E2E:N/A (no sync)\n",
+                  origSender, rxTimeStr);
+  }
+  
+  // Separator line
+  Serial.println("----------------------------------------------------");
+}
+#endif
+
 void logPacketData(uint16_t nodeId, uint16_t msgId, uint8_t hopCount, int64_t latencyUs, int16_t rssi, int8_t snr) {
+  // Legacy function - kept for compatibility but main logging is now in logGatewayPacketInfo
   #if DEBUG_MODE == DEBUG_MODE_GATEWAY_ONLY
-    if (logQueue == NULL) return;
-    
-    DataLogEntry entry;
-    entry.logType = (latencyUs >= 0) ? 1 : 0;  // 1=Latency, 0=PDR only
-    entry.timestamp = millis();
-    entry.nodeId = nodeId;
-    entry.messageId = msgId;
-    entry.hopCount = hopCount;
-    entry.latencyUs = latencyUs;
-    entry.pdr = 0.0;  // Will be calculated separately
-    entry.rssi = rssi;
-    entry.snr = snr;
-    snprintf(entry.extraData, sizeof(entry.extraData), "GW:%d", myInfo.id);
-    
-    // Send to queue (non-blocking)
-    xQueueSend(logQueue, &entry, 0);
+    // Optional: Add to queue for file logging if needed
+    // (The main serial output is now handled by logGatewayPacketInfo)
   #endif
 }
 
@@ -1169,8 +1641,8 @@ uint16_t selectBestNextHop() {
   for (uint8_t i = 0; i < neighbourCount; i++) {
     uint8_t idx = neighbourIndices[i];
     
-    // Filter 1: RSSI must be above RSSI_THRESHOLD_DBM (-115)
-    if (neighbours[idx].rssi < RSSI_THRESHOLD_DBM) continue;
+    // Filter 1: RSSI must be above rssiThresholdDbm (configurable, default -115)
+    if (neighbours[idx].rssi < rssiThresholdDbm) continue;
     
     // Filter 2: Must be bidirectional and have valid hop distance
     if (!neighbours[idx].amIListedAsNeighbour) continue;
@@ -1178,12 +1650,12 @@ uint16_t selectBestNextHop() {
     if (neighbours[idx].hoppingDistance == 0x7F) continue;
     
     // Selection criteria:
-    // 1. Prefer RSSI > MIN_RSSI_THRESHOLD (-100)
+    // 1. Prefer RSSI > rssiGoodQualityDbm (configurable, default -100)
     // 2. Then prefer lower hop count
     // 3. Finally prefer better SNR as tie-breaker
     
-    bool currentGoodRssi = (neighbours[idx].rssi > MIN_RSSI_THRESHOLD);
-    bool bestGoodRssi = (bestRssi > MIN_RSSI_THRESHOLD);
+    bool currentGoodRssi = (neighbours[idx].rssi > rssiGoodQualityDbm);
+    bool bestGoodRssi = (bestRssi > rssiGoodQualityDbm);
     
     bool shouldSelect = false;
     
@@ -1273,7 +1745,7 @@ void transmitUnifiedPacket() {
   char dataToSend[SENSOR_DATA_LENGTH + 1] = {0};
   uint16_t tracking[MAX_TRACKING_HOPS] = {0};
   #if ENABLE_WIFI == 1 && ENABLE_LATENCY_CALC == 1
-    int64_t embeddedTxTimestamp = 0;  // For forwarding
+    int64_t embeddedTxTimestamp = 0;  // For forwarding (works even after WiFi disconnect)
   #endif
   
   // Priority 1: Check forward queue (send one forwarded message per cycle)
@@ -1295,6 +1767,11 @@ void transmitUnifiedPacket() {
       
       // Select next hop
       hopDecisionTarget = selectBestNextHop();
+      
+      // Track routing statistics for forwarded messages
+      if (hopDecisionTarget > 0) {
+        updateOwnRouteStats(hopDecisionTarget);
+      }
     }
   }
   
@@ -1314,6 +1791,11 @@ void transmitUnifiedPacket() {
     
     // Select next hop
     hopDecisionTarget = selectBestNextHop();
+    
+    // Track routing statistics for own messages
+    if (hopDecisionTarget > 0) {
+      updateOwnRouteStats(hopDecisionTarget);
+    }
     
     // Store initial timestamp for latency tracking (will be embedded in packet)
     #if ENABLE_WIFI == 1 && ENABLE_LATENCY_CALC == 1
@@ -1388,6 +1870,13 @@ void transmitUnifiedPacket() {
           formatTimestamp(txTimestampUs, timeStr, sizeof(timeStr));
           DEBUG_PRINT("[Node %d] [TX_TS_EMBED] MsgID:%d T:%s\n", myInfo.id, msgId, timeStr);
         #endif
+      } else if (dataMode == DATA_MODE_OWN && !timeSynced) {
+        // Warning: sending without timestamp because NTP not synced
+        static bool warnPrinted = false;
+        if (!warnPrinted) {
+          Serial.printf("[Node %d] WARNING: Sending without timestamp - NTP not synced\n", myInfo.id);
+          warnPrinted = true;
+        }
       } else if (dataMode == DATA_MODE_FORWARD && embeddedTxTimestamp > 0) {
         // Forward: preserve the original TX timestamp from sender
         txBuffer[40] = (uint8_t)((embeddedTxTimestamp >> 56) & 0xFF);
@@ -1461,19 +1950,24 @@ uint8_t processRxPacket() {
   #endif
   
   // RSSI FILTER: Ignore packets with RSSI below threshold
-  if (rxRssi < RSSI_THRESHOLD_DBM) {
+  // Debug: Always log RSSI check for troubleshooting
+  Serial.printf("[Node %d] [RSSI_CHECK] From:%d RSSI:%d Threshold:%d %s\n",
+                myInfo.id, senderId, rxRssi, rssiThresholdDbm,
+                (rxRssi < rssiThresholdDbm) ? "→ REJECT" : "→ ACCEPT");
+  
+  if (rxRssi < rssiThresholdDbm) {
     #if ENABLE_WIFI == 1 && DEBUG_MODE == DEBUG_MODE_WIFI_MONITOR
       // Quick non-blocking event (pre-formatted to minimize processing)
       char rssiEvent[96];
       snprintf(rssiEvent, sizeof(rssiEvent), 
               "From:N%d,RSSI:%ddBm,Threshold:%ddBm,Status:REJECTED",
-              senderId, rxRssi, RSSI_THRESHOLD_DBM);
+              senderId, rxRssi, rssiThresholdDbm);
       sendWifiEvent("RSSI_LOW", rssiEvent);  // Non-blocking queue
     #endif
     
     #ifdef VERBOSE
       Serial.printf("[Node %d] [RX_REJECT] RSSI too low from Node %d: %d < %d dBm\n",
-                    myInfo.id, senderId, rxRssi, RSSI_THRESHOLD_DBM);
+                    myInfo.id, senderId, rxRssi, rssiThresholdDbm);
     #endif
     
     return 255;  // Return invalid slot, ignore this packet completely
@@ -1657,14 +2151,14 @@ uint8_t processRxPacket() {
     #if IS_REFERENCE == 0
     {
       if (neighbours[selectedNeighbourIdx].hoppingDistance != 0x7F &&
-          neighbours[selectedNeighbourIdx].rssi >= RSSI_THRESHOLD_DBM) {
+          neighbours[selectedNeighbourIdx].rssi >= rssiThresholdDbm) {
         uint8_t newHop = neighbours[selectedNeighbourIdx].hoppingDistance + 1;
         if (newHop < myInfo.hoppingDistance) {
           myInfo.hoppingDistance = newHop;
           Serial.printf("[Node %d] [HOP] Updated to %d via node %d (RSSI:%d)\n", 
                         myInfo.id, myInfo.hoppingDistance, senderId, neighbours[selectedNeighbourIdx].rssi);
         }
-      } else if (neighbours[selectedNeighbourIdx].rssi < RSSI_THRESHOLD_DBM) {
+      } else if (neighbours[selectedNeighbourIdx].rssi < rssiThresholdDbm) {
         Serial.printf("[Node %d] [HOP_SKIP] Node %d - RSSI too low (%d)\n",
                       myInfo.id, senderId, neighbours[selectedNeighbourIdx].rssi);
       }
@@ -1673,7 +2167,7 @@ uint8_t processRxPacket() {
       // CYCLE SYNCHRONIZATION: Sync from neighbors with lower hop distance (closer to gateway)
       // Only requires RX from upstream node - no bidirectional needed
       if (neighbours[selectedNeighbourIdx].hoppingDistance < myInfo.hoppingDistance &&
-          neighbours[selectedNeighbourIdx].rssi >= RSSI_THRESHOLD_DBM) {
+          neighbours[selectedNeighbourIdx].rssi >= rssiThresholdDbm) {
         // Cycle validation logic: check for sequential consistency
         if (!cycleValidated) {
           // Check if cycle is sequential (0->1->2->3->4)
@@ -1788,18 +2282,48 @@ uint8_t processRxPacket() {
           return 0; // Exit early
         }
         
+        // Variables for logging
+        int64_t rxTimestampUs = 0;
+        int64_t txTimestampUs = 0;
+        int64_t latencyUs = -1;
+        
         #if ENABLE_PDR_TRACKING == 1
           // Update PDR statistics for this sender
           updatePdrStats(origSender, msgId);
           
+          // Update routing statistics at gateway
+          // Analyze tracking array to determine routes used
+          for (uint8_t i = 0; i < hopCount && i < MAX_TRACKING_HOPS; i++) {
+            if (tracking[i] > 0) {
+              uint16_t fromNode = tracking[i];
+              uint16_t toNode;
+              uint8_t routeType = ROUTE_TYPE_PRIMARY;  // Default to primary
+              
+              if (i == hopCount - 1) {
+                // Last hop: sent to gateway
+                toNode = myInfo.id;  // Gateway ID
+              } else if (i + 1 < MAX_TRACKING_HOPS && tracking[i + 1] > 0) {
+                // Intermediate hop: sent to next node in tracking
+                toNode = tracking[i + 1];
+              } else {
+                toNode = myInfo.id;  // Assume gateway
+              }
+              
+              // Determine if this is primary or alternative route
+              if (hopCount > 1 && i == 0) {
+                routeType = ROUTE_TYPE_PRIMARY;
+              }
+              
+              updateRouteStats(fromNode, toNode, routeType);
+            }
+          }
+          
           // Send PDR update via WiFi (WIFI_MONITOR mode)
           #if DEBUG_MODE == DEBUG_MODE_WIFI_MONITOR && ENABLE_WIFI == 1
-            // Send individual packet reception event
             if (wifiEventQueue != NULL && WiFi.status() == WL_CONNECTED) {
               WiFiEvent evt;
               int64_t timestamp = timeSynced ? getCurrentTimeUs() : (int64_t)micros();
               
-              // Find this node's PDR stats
               for (uint8_t i = 0; i < pdrNodeCount; i++) {
                 if (pdrStats[i].nodeId == origSender) {
                   snprintf(evt.message, sizeof(evt.message), 
@@ -1817,9 +2341,7 @@ uint8_t processRxPacket() {
         #if ENABLE_WIFI == 1 && ENABLE_LATENCY_CALC == 1
           // Calculate end-to-end latency if time synced
           if (timeSynced) {
-            int64_t rxTimestampUs = getCurrentTimeUs();
-            int64_t latencyUs = -1;
-            int64_t txTimestampUs = 0;
+            rxTimestampUs = getCurrentTimeUs();
             
             // Extract embedded TX timestamp from packet (bytes 40-47)
             txTimestampUs = ((int64_t)rxBuffer[40] << 56) |
@@ -1835,18 +2357,19 @@ uint8_t processRxPacket() {
             int64_t currentTime = getCurrentTimeUs();
             int64_t timeDiff = currentTime - txTimestampUs;
             
+            // Debug: Log when latency calculation fails
+            #if DEBUG_MODE == DEBUG_MODE_GATEWAY_ONLY
+              if (txTimestampUs == 0) {
+                Serial.printf("[LAT_FAIL] Node %d has no timestamp embedded (sender not NTP synced?)\n", origSender);
+              } else if (timeDiff <= 0) {
+                Serial.printf("[LAT_FAIL] Node %d timeDiff=%lld (gateway time behind sender)\n", origSender, timeDiff);
+              } else if (timeDiff >= 3600000000LL) {
+                Serial.printf("[LAT_FAIL] Node %d timeDiff=%.1fs (>1h, clock drift?)\n", origSender, timeDiff/1000000.0);
+              }
+            #endif
+            
             if (txTimestampUs > 0 && timeDiff > 0 && timeDiff < 3600000000LL) {
               latencyUs = timeDiff;
-            } else {
-              #if LATENCY_VERBOSE_LOG == 1
-                DEBUG_PRINT("[GW %d] [LATENCY] Invalid TX timestamp: %lld (diff: %lld)\n", 
-                           myInfo.id, txTimestampUs, timeDiff);
-              #endif
-            }
-            
-            // Calculate and log latency
-            if (latencyUs >= 0) {
-              double latencyMs = latencyUs / 1000.0;
               
               // Update statistics
               totalLatencyCalculations++;
@@ -1869,31 +2392,13 @@ uint8_t processRxPacket() {
                 updateNodeLatency(origSender, latencyUs);
               #endif
               
-              #if LATENCY_VERBOSE_LOG == 1
-                // Full logging (can add overhead)
-                char rxTimeStr[32], txTimeStr[32];
-                formatTimestamp(rxTimestampUs, rxTimeStr, sizeof(rxTimeStr));
-                formatTimestamp(txTimestampUs, txTimeStr, sizeof(txTimeStr));
-                DEBUG_PRINT("[GW %d] [RX_TS] %s\n", myInfo.id, rxTimeStr);
-                DEBUG_PRINT_LATENCY("[GW %d] [LATENCY] MsgID:%d E2E:%.3fms (%dhop) TX:%s\n", 
-                              myInfo.id, msgId, latencyMs, hopCount, txTimeStr);
-              #else
-                // Minimal logging (reduce overhead)
-                DEBUG_PRINT_LATENCY("[GW] LAT:%d %.1fms %dh\n", msgId, latencyMs, hopCount);
-              #endif
-              
-              // Log to data collection queue (only in GATEWAY_ONLY mode)
-              #if DEBUG_MODE == DEBUG_MODE_GATEWAY_ONLY
-                logPacketData(origSender, msgId, hopCount, latencyUs, rxRssi, rxSnr);
-              #endif
-              
               // Send latency data via WiFi (WIFI_MONITOR mode)
               #if DEBUG_MODE == DEBUG_MODE_WIFI_MONITOR
                 sendLatencyDataWifi(origSender, msgId, hopCount, latencyUs, rxRssi, rxSnr);
               #endif
               
               // WiFi event: Gateway received with routing info
-              #if ENABLE_WIFI == 1 && DEBUG_MODE == DEBUG_MODE_WIFI_MONITOR
+              #if DEBUG_MODE == DEBUG_MODE_WIFI_MONITOR
                 char routePath[64] = "";
                 for (uint8_t i = 0; i < hopCount && i < MAX_TRACKING_HOPS; i++) {
                   if (tracking[i] > 0) {
@@ -1904,21 +2409,23 @@ uint8_t processRxPacket() {
                 }
                 char details[256];
                 int64_t timestamp = timeSynced ? getCurrentTimeUs() : (int64_t)micros();
+                double latencyMs = latencyUs / 1000.0;
                 snprintf(details, sizeof(details), 
                          "Msg:%d,From:%d,Hops:%d,Route:[%s>GW],Lat:%.1fms,RSSI:%d,TS:%lld",
                          msgId, origSender, hopCount, routePath, latencyMs, rxRssi, timestamp);
                 sendWifiEvent("GW_RX_DATA", details);
               #endif
-            } else if (origSender != myInfo.id) {
-              // Only log if it's not from gateway itself (reduce spam)
-              #if LATENCY_VERBOSE_LOG == 1
-                DEBUG_PRINT("[GW %d] [LATENCY] MsgID:%d - TX timestamp N/A (remote)\n", myInfo.id, msgId);
-              #endif
             }
           }
         #endif
         
-        DEBUG_PRINT("[GW] RX:%d from:%d %s\n", msgId, origSender, sensorDataReceived);
+        // ════════════════════════════════════════════════════════════════
+        // GATEWAY_ONLY MODE: Print 3 clear human-readable log messages
+        // ════════════════════════════════════════════════════════════════
+        #if DEBUG_MODE == DEBUG_MODE_GATEWAY_ONLY
+          logGatewayPacketInfo(origSender, msgId, hopCount, tracking, 
+                               txTimestampUs, rxTimestampUs, latencyUs, rxRssi, rxSnr);
+        #endif
         
         #if ENABLE_WIFI == 1
           // Add to WiFi batch buffer for later sending
@@ -2006,7 +2513,7 @@ void recalculateHopCount() {
     for (uint8_t i = 0; i < MAX_NEIGHBOURS; i++) {
       if (neighbours[i].id != 0 && 
           neighbours[i].hoppingDistance != 0x7F &&
-          neighbours[i].rssi >= RSSI_THRESHOLD_DBM) {  // Filter by RSSI
+          neighbours[i].rssi >= rssiThresholdDbm) {  // Filter by RSSI
         
         uint8_t candidateHop = neighbours[i].hoppingDistance + 1;
         if (candidateHop < minHop) {
@@ -2050,15 +2557,15 @@ void updateNeighbourStatus() {
         
         memset(&neighbours[i], 0, sizeof(NeighbourInfo));
         neighbourCount = max(0, (int)neighbourCount - 1);
-      } else if (neighbours[i].rssi < RSSI_THRESHOLD_DBM) {
+      } else if (neighbours[i].rssi < rssiThresholdDbm) {
         Serial.printf("[Node %d] [RSSI_LOW] Removing neighbor %d (RSSI:%d < %d)\n", 
-                      myInfo.id, neighbours[i].id, neighbours[i].rssi, RSSI_THRESHOLD_DBM);
+                      myInfo.id, neighbours[i].id, neighbours[i].rssi, rssiThresholdDbm);
         
         #if ENABLE_WIFI == 1 && DEBUG_MODE == DEBUG_MODE_WIFI_MONITOR
           char eventDetails[96];
           snprintf(eventDetails, sizeof(eventDetails), 
                   "NodeID:%d,Reason:RSSI_LOW,RSSI:%ddBm,Threshold:%ddBm",
-                  neighbours[i].id, neighbours[i].rssi, RSSI_THRESHOLD_DBM);
+                  neighbours[i].id, neighbours[i].rssi, rssiThresholdDbm);
           sendWifiEvent("NEIGHBOR_REMOVED", eventDetails);
         #endif
         
@@ -2165,6 +2672,14 @@ void setup() {
     strncpy(activePassword, runtimeConfig.password, MAX_PASS_LEN);
     strncpy(activeServerIP, runtimeConfig.serverIP, MAX_IP_LEN);
     activeDebugMode = runtimeConfig.debugMode;
+    
+    // Load RSSI thresholds from EEPROM
+    rssiThresholdDbm = runtimeConfig.rssiMin;
+    rssiGoodQualityDbm = runtimeConfig.rssiGood;
+    
+    // Load TX Power from EEPROM
+    currentTxPower = runtimeConfig.txPower;
+    
     configLoaded = true;
     Serial.println("[CONFIG] Loaded from EEPROM");
   } else {
@@ -2178,6 +2693,11 @@ void setup() {
     strncpy(runtimeConfig.serverIP, SERVER_IP, MAX_IP_LEN);
     runtimeConfig.debugMode = DEBUG_MODE;
     
+    // Use default RSSI thresholds (already initialized in variable declaration)
+    runtimeConfig.rssiMin = rssiThresholdDbm;
+    runtimeConfig.rssiGood = rssiGoodQualityDbm;
+    runtimeConfig.txPower = currentTxPower;
+    
     configLoaded = false;
     Serial.println("[CONFIG] Using defaults from settings.h");
   }
@@ -2185,8 +2705,10 @@ void setup() {
   Serial.printf("[CONFIG] SSID: %s\n", activeSSID);
   Serial.printf("[CONFIG] Server: %s\n", activeServerIP);
   Serial.printf("[CONFIG] Mode: %d\n", activeDebugMode);
+  Serial.printf("[CONFIG] RSSI Min: %d dBm, Good: %d dBm\n", rssiThresholdDbm, rssiGoodQualityDbm);
+  Serial.printf("[CONFIG] TX Power: %d dBm\n", currentTxPower);
   Serial.println("[CONFIG] Type 'HELP' for serial commands");
-  
+
   Wire.begin(I2C_SDA, I2C_SCL);
   Serial.printf("I2C initialized - SDA:%d SCL:%d\n", I2C_SDA, I2C_SCL);
   
@@ -2229,7 +2751,9 @@ void setup() {
         
         if (gettimeofday(&tv, NULL) == 0 && tv.tv_sec > 100000) {
           // Capture exact time with microsecond precision
-          microsAtSync = micros();
+          // Initialize overflow-safe time tracking
+          lastMicrosReading = micros();
+          totalElapsedUs = 0;  // Reset elapsed counter
           ntpEpochAtSync = (int64_t)tv.tv_sec * 1000000LL + (int64_t)tv.tv_usec;
           timeSynced = true;
           
@@ -2239,7 +2763,7 @@ void setup() {
           Serial.printf("[Node %d] [TIME] %02d:%02d:%02d.%06ld\n", 
                         myInfo.id, timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec, tv.tv_usec);
           Serial.printf("[Node %d] [TIME] Epoch: %lld μs\n", myInfo.id, ntpEpochAtSync);
-          Serial.printf("[Node %d] [TIME] Sync micros: %llu\n", myInfo.id, microsAtSync);
+          Serial.printf("[Node %d] [TIME] Initial micros: %lu\n", myInfo.id, lastMicrosReading);
           
           #if ENABLE_DRIFT_COMPENSATION == 1
             lastDriftCheck = millis();
@@ -2250,8 +2774,77 @@ void setup() {
           Serial.printf("[Node %d] [TIME] NTP sync timeout\n", myInfo.id);
         }
       #endif
+      
+      // ========== WiFi DISCONNECT DECISION ==========
+      // Show clear proof of WiFi behavior based on node type and mode
+      Serial.println("\n========================================");
+      Serial.printf("[Node %d] WiFi Behavior Decision:\n", myInfo.id);
+      Serial.printf("  IS_REFERENCE = %d (%s)\n", IS_REFERENCE, IS_REFERENCE ? "GATEWAY" : "SENSOR NODE");
+      Serial.printf("  DEBUG_MODE = %d (%s)\n", DEBUG_MODE, 
+                    DEBUG_MODE == 0 ? "OFF" : (DEBUG_MODE == 1 ? "GATEWAY_ONLY" : "WIFI_MONITOR"));
+      Serial.printf("  WIFI_DISCONNECT_AFTER_NTP = %d\n", WIFI_DISCONNECT_AFTER_NTP);
+      Serial.printf("  timeSynced = %s\n", timeSynced ? "true" : "false");
+      
+      #if WIFI_DISCONNECT_AFTER_NTP == 1 && DEBUG_MODE != DEBUG_MODE_WIFI_MONITOR && IS_REFERENCE == 0
+        Serial.println("\n  >> DECISION: DISCONNECT WiFi");
+        Serial.println("  >> Reason: Sensor node + NTP sync complete + not WIFI_MONITOR mode");
+        Serial.printf("[Node %d] [WIFI] Disconnecting WiFi now...\n", myInfo.id);
+        
+        // Verify WiFi status before disconnect
+        Serial.printf("[Node %d] [WIFI] Status before: Connected=%s, IP=%s\n", 
+                      myInfo.id, 
+                      WiFi.status() == WL_CONNECTED ? "YES" : "NO",
+                      WiFi.localIP().toString().c_str());
+        
+        WiFi.disconnect(true);
+        WiFi.mode(WIFI_OFF);
+        delay(100);  // Wait for WiFi to fully disconnect
+        
+        // Verify WiFi status after disconnect
+        Serial.printf("[Node %d] [WIFI] Status after: Connected=%s\n", 
+                      myInfo.id, 
+                      WiFi.status() == WL_CONNECTED ? "YES" : "NO");
+        Serial.printf("[Node %d] [WIFI] ✓ WiFi DISABLED - TDMA can run without interference\n", myInfo.id);
+        Serial.printf("[Node %d] [WIFI] ✓ Time tracking still works (timeSynced=%s)\n", myInfo.id, timeSynced ? "true" : "false");
+      #elif IS_REFERENCE == 1
+        Serial.println("\n  >> DECISION: KEEP WiFi CONNECTED");
+        Serial.println("  >> Reason: Gateway node needs WiFi for data collection");
+        Serial.printf("[Node %d] [WIFI] Gateway staying connected: IP=%s\n", 
+                      myInfo.id, WiFi.localIP().toString().c_str());
+      #elif DEBUG_MODE == DEBUG_MODE_WIFI_MONITOR
+        Serial.println("\n  >> DECISION: KEEP WiFi CONNECTED");
+        Serial.println("  >> Reason: WIFI_MONITOR mode requires continuous WiFi");
+        Serial.printf("[Node %d] [WIFI] Monitor mode staying connected: IP=%s\n", 
+                      myInfo.id, WiFi.localIP().toString().c_str());
+      #else
+        Serial.println("\n  >> DECISION: KEEP WiFi CONNECTED");
+        Serial.println("  >> Reason: WIFI_DISCONNECT_AFTER_NTP is disabled");
+      #endif
+      Serial.println("========================================\n");
+      
+      // Gateway: Initialize UDP for data reception (all modes)
+      #if IS_REFERENCE == 1
+        udpMonitor.begin(MONITOR_UDP_PORT);
+        udpCommand.begin(COMMAND_UDP_PORT);
+        Serial.printf("[GW %d] [UDP] Monitor port: %d, Command port: %d\n", 
+                      myInfo.id, MONITOR_UDP_PORT, COMMAND_UDP_PORT);
+      #endif
     } else {
-      Serial.printf("\n[Node %d] [WIFI] Connection failed\n", myInfo.id);
+      Serial.printf("\n[Node %d] [WIFI] Connection failed after %d retries\n", myInfo.id, wifiRetry);
+      Serial.println("\n========================================");
+      Serial.printf("[Node %d] WiFi Connection FAILED:\n", myInfo.id);
+      Serial.println("  - NTP sync: SKIPPED (no internet)");
+      Serial.println("  - timeSynced: false");
+      Serial.println("  - Latency timestamp: DISABLED");
+      Serial.println("  - TDMA: Will still work normally");
+      Serial.println("  - Sensor data: Will still be sent");
+      Serial.println("\n  NOTE: Node will operate without time sync.");
+      Serial.println("  Gateway will show 'no timestamp' for this node.");
+      Serial.println("========================================\n");
+      
+      // Make sure WiFi is off to not interfere with TDMA
+      WiFi.disconnect(true);
+      WiFi.mode(WIFI_OFF);
     }
   #endif
   
@@ -2424,7 +3017,7 @@ void checkSerialCommands() {
             networkPdr = 100.0;
           #endif
           
-          Serial.printf("{NODE%d} [CMD] ⏸️  TDMA STOPPED - All data reset\n", myInfo.id);
+          Serial.printf("{NODE%d} [CMD] TDMA STOPPED - All data reset\n", myInfo.id);
         }
         else if (cmd == "START" || cmd == "TDMA_ON") {
           uint32_t delayMs = 0;
@@ -2479,17 +3072,6 @@ void checkSerialCommands() {
             Serial.printf("{NODE%d} [ERROR] Invalid IP (max %d chars)\n", myInfo.id, MAX_IP_LEN);
           }
         }
-        else if (cmd == "SET_MODE") {
-          int mode = param.toInt();
-          if (mode >= 0 && mode <= 2) {
-            runtimeConfig.debugMode = (uint8_t)mode;
-            const char* modeNames[] = {"OFF", "GATEWAY_ONLY", "WIFI_MONITOR"};
-            Serial.printf("{NODE%d} [CONFIG] Debug mode set to: %d (%s) (use SAVE to apply)\n", 
-                          myInfo.id, mode, modeNames[mode]);
-          } else {
-            Serial.printf("{NODE%d} [ERROR] Invalid mode (0=OFF, 1=GATEWAY, 2=WIFI)\n", myInfo.id);
-          }
-        }
         else if (cmd == "SAVE") {
           Serial.printf("{NODE%d} [CONFIG] Saving to EEPROM...\n", myInfo.id);
           configSave(runtimeConfig);
@@ -2526,14 +3108,169 @@ void checkSerialCommands() {
           Serial.printf("  TDMA_ON / START [delay_ms]  - Enable TDMA\n");
           Serial.printf("  TDMA_OFF / STOP             - Disable TDMA & reset data\n");
           Serial.printf("  STATUS                      - Show current status\n");
-          Serial.printf("\nConfiguration (saved to EEPROM):\n");
+          Serial.printf("\nRSSI Configuration (runtime, use SAVE_RSSI to persist):\n");
+          Serial.printf("  SET_RSSI_MIN <dBm>          - Min RSSI threshold (default -115)\n");
+          Serial.printf("  SET_RSSI_GOOD <dBm>         - Good quality threshold (default -100)\n");
+          Serial.printf("  SAVE_RSSI                   - Save RSSI settings to EEPROM\n");
+          Serial.printf("  SHOW_RSSI                   - Show current RSSI settings\n");
+          Serial.printf("\nTX Power (runtime, use SAVE_TXPOWER to persist):\n");
+          Serial.printf("  SET_TXPOWER <dBm>           - Set TX power (-9 to +22 dBm)\n");
+          Serial.printf("  SAVE_TXPOWER                - Save TX power to EEPROM\n");
+          Serial.printf("  SHOW_TXPOWER                - Show TX power settings\n");
+          Serial.printf("\nWiFi/Server (requires SAVE & reboot):\n");
           Serial.printf("  SET_SSID <ssid>             - Set WiFi SSID\n");
           Serial.printf("  SET_PASS <password>         - Set WiFi password\n");
           Serial.printf("  SET_SERVER <ip>             - Set server IP\n");
-          Serial.printf("  SET_MODE <0/1/2>            - Set debug mode\n");
           Serial.printf("  SHOW                        - Show configuration\n");
           Serial.printf("  SAVE                        - Save & reboot\n");
-          Serial.printf("  RESET_CONFIG                - Clear EEPROM & reboot\n\n");
+          Serial.printf("  RESET_CONFIG                - Clear EEPROM & reboot\n");
+          Serial.printf("\nTime Debugging:\n");
+          Serial.printf("  TIME                        - Show current time status\n");
+          Serial.printf("  TEST_OVERFLOW [mins]        - Simulate micros() overflow\n\n");
+        }
+        // ============= RSSI CONFIGURATION COMMANDS =============
+        else if (cmd == "SET_RSSI_MIN") {
+          if (param.length() > 0) {
+            int16_t newVal = param.toInt();
+            if (newVal >= -130 && newVal <= -50) {
+              rssiThresholdDbm = newVal;
+              runtimeConfig.rssiMin = newVal;  // Update pending config
+              Serial.printf("{NODE%d} [RSSI] Minimum threshold set to: %d dBm\n", myInfo.id, rssiThresholdDbm);
+              Serial.printf("{NODE%d} [RSSI] Packets below this RSSI will be REJECTED\n", myInfo.id);
+              Serial.printf("{NODE%d} [RSSI] Use SAVE_RSSI to persist to EEPROM\n", myInfo.id);
+            } else {
+              Serial.printf("{NODE%d} [ERROR] Value must be -130 to -50 dBm\n", myInfo.id);
+            }
+          } else {
+            Serial.printf("{NODE%d} [RSSI] Current min threshold: %d dBm\n", myInfo.id, rssiThresholdDbm);
+          }
+        }
+        else if (cmd == "SET_RSSI_GOOD") {
+          if (param.length() > 0) {
+            int16_t newVal = param.toInt();
+            if (newVal >= -120 && newVal <= -40) {
+              rssiGoodQualityDbm = newVal;
+              runtimeConfig.rssiGood = newVal;  // Update pending config
+              Serial.printf("{NODE%d} [RSSI] Good quality threshold set to: %d dBm\n", myInfo.id, rssiGoodQualityDbm);
+              Serial.printf("{NODE%d} [RSSI] Neighbors above this RSSI are prioritized for hop selection\n", myInfo.id);
+              Serial.printf("{NODE%d} [RSSI] Use SAVE_RSSI to persist to EEPROM\n", myInfo.id);
+            } else {
+              Serial.printf("{NODE%d} [ERROR] Value must be -120 to -40 dBm\n", myInfo.id);
+            }
+          } else {
+            Serial.printf("{NODE%d} [RSSI] Current good quality threshold: %d dBm\n", myInfo.id, rssiGoodQualityDbm);
+          }
+        }
+        else if (cmd == "SAVE_RSSI") {
+          // Save RSSI thresholds to EEPROM without full reboot
+          runtimeConfig.rssiMin = rssiThresholdDbm;
+          runtimeConfig.rssiGood = rssiGoodQualityDbm;
+          configSave(runtimeConfig);
+          Serial.printf("{NODE%d} [RSSI] ✓ Saved to EEPROM!\n", myInfo.id);
+          Serial.printf("{NODE%d} [RSSI] Min: %d dBm, Good: %d dBm\n", myInfo.id, rssiThresholdDbm, rssiGoodQualityDbm);
+        }
+        else if (cmd == "SHOW_RSSI") {
+          Serial.printf("\n{NODE%d} === RSSI Configuration ===\n", myInfo.id);
+          Serial.printf("{NODE%d} [RSSI] Minimum threshold (reject below): %d dBm\n", myInfo.id, rssiThresholdDbm);
+          Serial.printf("{NODE%d} [RSSI] Good quality threshold (prioritize above): %d dBm\n", myInfo.id, rssiGoodQualityDbm);
+          Serial.printf("{NODE%d} [RSSI] Saved in EEPROM: Min=%d, Good=%d\n", myInfo.id, runtimeConfig.rssiMin, runtimeConfig.rssiGood);
+          Serial.printf("{NODE%d} [RSSI] Usage:\n", myInfo.id);
+          Serial.printf("         - Packets with RSSI < %d dBm are rejected\n", rssiThresholdDbm);
+          Serial.printf("         - Neighbors with RSSI >= %d dBm are preferred for routing\n\n", rssiGoodQualityDbm);
+        }
+        // ============= TX POWER CONFIGURATION COMMANDS =============
+        else if (cmd == "SET_TXPOWER") {
+          if (param.length() > 0) {
+            int8_t newVal = param.toInt();
+            if (newVal >= -9 && newVal <= 22) {
+              currentTxPower = newVal;
+              runtimeConfig.txPower = newVal;
+              
+              // Apply immediately to radio (no reboot needed!)
+              radio.SetTxPower(currentTxPower);
+              
+              Serial.printf("{NODE%d} [TXPOWER] ✓ TX Power set to: %d dBm (applied immediately)\n", myInfo.id, currentTxPower);
+              Serial.printf("{NODE%d} [TXPOWER] Use SAVE_TXPOWER to persist to EEPROM\n", myInfo.id);
+            } else {
+              Serial.printf("{NODE%d} [ERROR] TX Power must be -9 to +22 dBm (SX1262 range)\n", myInfo.id);
+            }
+          } else {
+            Serial.printf("{NODE%d} [TXPOWER] Current TX Power: %d dBm\n", myInfo.id, currentTxPower);
+          }
+        }
+        else if (cmd == "SAVE_TXPOWER") {
+          runtimeConfig.txPower = currentTxPower;
+          configSave(runtimeConfig);
+          Serial.printf("{NODE%d} [TXPOWER] ✓ Saved to EEPROM: %d dBm\n", myInfo.id, currentTxPower);
+        }
+        else if (cmd == "SHOW_TXPOWER") {
+          Serial.printf("\n{NODE%d} === TX Power Configuration ===\n", myInfo.id);
+          Serial.printf("{NODE%d} [TXPOWER] Current: %d dBm\n", myInfo.id, currentTxPower);
+          Serial.printf("{NODE%d} [TXPOWER] Saved in EEPROM: %d dBm\n", myInfo.id, runtimeConfig.txPower);
+          Serial.printf("{NODE%d} [TXPOWER] Default (settings.h): %d dBm\n", myInfo.id, TX_OUTPUT_POWER);
+          Serial.printf("{NODE%d} [TXPOWER] Valid range: -9 to +22 dBm (SX1262)\n\n", myInfo.id);
+        }
+        // ============= TIME DEBUGGING COMMANDS =============
+        else if (cmd == "TIME") {
+          #if ENABLE_WIFI == 1
+            if (timeSynced) {
+              int64_t currentTimeUs = getCurrentTimeUs();
+              int64_t timeSec = currentTimeUs / 1000000LL;
+              int64_t microPart = currentTimeUs % 1000000LL;
+              
+              struct tm timeinfo;
+              time_t timeSec_t = (time_t)timeSec;
+              localtime_r(&timeSec_t, &timeinfo);
+              
+              Serial.printf("\n{NODE%d} === Time Status ===\n", myInfo.id);
+              Serial.printf("  Current: %02d:%02d:%02d.%06lld\n", 
+                            timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec, microPart);
+              Serial.printf("  NTP Epoch at sync: %lld us\n", ntpEpochAtSync);
+              Serial.printf("  Total elapsed: %llu us (%.2f hours)\n", 
+                            totalElapsedUs, totalElapsedUs / 3600000000.0);
+              Serial.printf("  Last micros reading: %lu\n", lastMicrosReading);
+              Serial.printf("  Current micros(): %lu\n", micros());
+              Serial.printf("  Overflow in: %.1f minutes\n", 
+                            (0xFFFFFFFF - micros()) / 60000000.0);
+              Serial.printf("  timeSynced: %s\n\n", timeSynced ? "true" : "false");
+            } else {
+              Serial.printf("{NODE%d} [TIME] Not synced with NTP\n", myInfo.id);
+            }
+          #else
+            Serial.printf("{NODE%d} [TIME] WiFi disabled\n", myInfo.id);
+          #endif
+        }
+        else if (cmd == "TEST_OVERFLOW") {
+          #if ENABLE_WIFI == 1
+            if (timeSynced) {
+              // Simulate time as if X minutes have passed (for testing overflow handling)
+              uint32_t simulateMins = param.length() > 0 ? param.toInt() : 70;
+              
+              Serial.printf("{NODE%d} [TEST] Simulating %lu minutes of elapsed time...\n", myInfo.id, simulateMins);
+              Serial.printf("{NODE%d} [TEST] Before: totalElapsedUs=%llu, lastMicrosReading=%lu\n", 
+                            myInfo.id, totalElapsedUs, lastMicrosReading);
+              
+              // Add simulated elapsed time (will cause overflow check to handle it correctly)
+              uint64_t simulatedUs = (uint64_t)simulateMins * 60 * 1000000;
+              totalElapsedUs += simulatedUs;
+              
+              // Test getCurrentTimeUs to make sure it works
+              int64_t testTime = getCurrentTimeUs();
+              int64_t timeSec = testTime / 1000000LL;
+              struct tm timeinfo;
+              time_t timeSec_t = (time_t)timeSec;
+              localtime_r(&timeSec_t, &timeinfo);
+              
+              Serial.printf("{NODE%d} [TEST] After: totalElapsedUs=%llu\n", myInfo.id, totalElapsedUs);
+              Serial.printf("{NODE%d} [TEST] Time after simulation: %02d:%02d:%02d\n", 
+                            myInfo.id, timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+              Serial.printf("{NODE%d} [TEST] Overflow test PASSED - time calculation still works!\n\n", myInfo.id);
+            } else {
+              Serial.printf("{NODE%d} [TEST] Cannot test - NTP not synced\n", myInfo.id);
+            }
+          #else
+            Serial.printf("{NODE%d} [TEST] WiFi disabled\n", myInfo.id);
+          #endif
         }
         else if (cmd.length() > 0) {
           Serial.printf("{NODE%d} [ERROR] Unknown command: %s (type HELP)\n", myInfo.id, cmd.c_str());
@@ -2627,7 +3364,7 @@ void loop() {
         
         hasSensorDataToSend = true;
         
-        Serial.printf("[Node %d] [AUTO_SEND_SEQ] 🔄 My turn! Cycle:%d (ID:%d) MsgID:%u T:%.1f H:%.1f B:%d%% data:%s\n", 
+        Serial.printf("[Node %d] [AUTO_SEND_SEQ] My turn! Cycle:%d (ID:%d) MsgID:%u T:%.1f H:%.1f B:%d%% data:%s\n", 
                       myInfo.id, myInfo.syncedCycle, myInfo.id, ownMessageId, currentTemperature, currentHumidity, currentBattery, sensorDataToSend);
       }
     }

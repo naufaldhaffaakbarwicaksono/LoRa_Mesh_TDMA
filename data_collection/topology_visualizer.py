@@ -186,7 +186,27 @@ class TopologyVisualizer:
                        ha='left', va='center', fontweight='bold',
                        bbox=bbox_props, zorder=12)
             else:
-                stats_text = f"Hop: {node.hop_count}\nTX: {node.tx_count}\nRX: {node.rx_at_gateway}\nPDR: {node.pdr:.1f}%\nE2E Latency: {node.avg_latency:.1f}ms"
+                # Build stats text dynamically - only show available data
+                stats_lines = []
+                stats_lines.append(f"Hop: {node.hop_count}")
+                
+                # Only show TX if available (> 0)
+                if node.tx_count > 0:
+                    stats_lines.append(f"TX: {node.tx_count}")
+                
+                # Only show RX if available (> 0)
+                if node.rx_at_gateway > 0:
+                    stats_lines.append(f"RX: {node.rx_at_gateway}")
+                
+                # Only show PDR if we have both TX and RX data
+                if node.pdr is not None and node.pdr > 0 and node.tx_count > 0:
+                    stats_lines.append(f"PDR: {node.pdr:.1f}%")
+                
+                # Only show latency if available (> 0)
+                if node.avg_latency is not None and node.avg_latency > 0:
+                    stats_lines.append(f"E2E Latency: {node.avg_latency:.1f}ms")
+                
+                stats_text = "\n".join(stats_lines)
                 
                 # Position stats box to the right of node
                 stats_x = x + node_radius + 0.3

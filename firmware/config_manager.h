@@ -24,7 +24,10 @@
 #define ADDR_SERVER_IP    100  // 16 bytes
 #define ADDR_DEBUG_MODE   116  // 1 byte
 #define ADDR_NODE_ID      117  // 2 bytes (optional override)
-#define ADDR_CHECKSUM     119  // 1 byte
+#define ADDR_RSSI_MIN     120  // 2 bytes (int16_t)
+#define ADDR_RSSI_GOOD    122  // 2 bytes (int16_t)
+#define ADDR_TX_POWER     124  // 1 byte (int8_t, -9 to +22 dBm)
+#define ADDR_CHECKSUM     126  // 1 byte
 
 // Limits
 #define MAX_SSID_LEN      32
@@ -32,11 +35,19 @@
 #define MAX_IP_LEN        15
 
 // ============= RUNTIME CONFIG STRUCTURE =============
+// Default RSSI thresholds (can be overridden by EEPROM)
+#define DEFAULT_RSSI_MIN    -115  // Minimum threshold to accept packets
+#define DEFAULT_RSSI_GOOD   -100  // "Good quality" threshold for routing priority
+#define DEFAULT_TX_POWER    -9    // Default TX power (dBm), SX1262 range: -9 to +22
+
 struct RuntimeConfig {
   char ssid[MAX_SSID_LEN + 1];
   char password[MAX_PASS_LEN + 1];
   char serverIP[MAX_IP_LEN + 1];
   uint8_t debugMode;
+  int16_t rssiMin;      // Minimum RSSI threshold (dBm)
+  int16_t rssiGood;     // Good quality RSSI threshold (dBm)
+  int8_t txPower;       // TX power (dBm), range: -9 to +22
   bool valid;
 };
 
@@ -105,6 +116,25 @@ inline RuntimeConfig configLoad() {
   cfg.debugMode = EEPROM.read(ADDR_DEBUG_MODE);
   if (cfg.debugMode > 2) cfg.debugMode = 0;  // Validate
   
+  // Read RSSI thresholds
+  cfg.rssiMin = (int16_t)(EEPROM.read(ADDR_RSSI_MIN) | (EEPROM.read(ADDR_RSSI_MIN + 1) << 8));
+  cfg.rssiGood = (int16_t)(EEPROM.read(ADDR_RSSI_GOOD) | (EEPROM.read(ADDR_RSSI_GOOD + 1) << 8));
+  
+  // Validate RSSI values (use defaults if out of range)
+  if (cfg.rssiMin < -130 || cfg.rssiMin > -50 || cfg.rssiMin == 0) {
+    cfg.rssiMin = DEFAULT_RSSI_MIN;
+  }
+  if (cfg.rssiGood < -120 || cfg.rssiGood > -40 || cfg.rssiGood == 0) {
+    cfg.rssiGood = DEFAULT_RSSI_GOOD;
+  }
+  
+  // Read TX Power
+  cfg.txPower = (int8_t)EEPROM.read(ADDR_TX_POWER);
+  // Validate TX power (SX1262 range: -9 to +22 dBm)
+  if (cfg.txPower < -9 || cfg.txPower > 22) {
+    cfg.txPower = DEFAULT_TX_POWER;
+  }
+  
   cfg.valid = true;
   return cfg;
 }
@@ -132,6 +162,15 @@ inline void configSave(const RuntimeConfig& cfg) {
   
   // Write Debug Mode
   EEPROM.write(ADDR_DEBUG_MODE, cfg.debugMode);
+  
+  // Write RSSI thresholds
+  EEPROM.write(ADDR_RSSI_MIN, cfg.rssiMin & 0xFF);
+  EEPROM.write(ADDR_RSSI_MIN + 1, (cfg.rssiMin >> 8) & 0xFF);
+  EEPROM.write(ADDR_RSSI_GOOD, cfg.rssiGood & 0xFF);
+  EEPROM.write(ADDR_RSSI_GOOD + 1, (cfg.rssiGood >> 8) & 0xFF);
+  
+  // Write TX Power
+  EEPROM.write(ADDR_TX_POWER, (uint8_t)cfg.txPower);
   
   // Commit
   EEPROM.commit();
